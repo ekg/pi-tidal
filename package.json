@@ -1,0 +1,14 @@
+{
+  "name": "pi-tidal",
+  "version": "1.0.0",
+  "description": "Agent-driven TidalCycles live coding for pi: auto-eval of edited .tidal chunks, REPL error feedback into agent context, self-healing SuperDirt stack",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ekg/pi-tidal.git"
+  },
+  "pi": {
+    "extensions": ["extensions"],
+    "prompts": ["prompts"]
+  }
+}
