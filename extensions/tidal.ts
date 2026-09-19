@@ -193,7 +193,10 @@ export default function (pi: ExtensionAPI) {
 
 	async function ensureStack(cwd: string): Promise<string> {
 		const st = await queryScsynth();
-		if (!st.alive) {
+		// scsynth is UDP-silent for 30-90s after spawn (README: pipe backpressure
+		// while sclang churns). If the port is bound the server is NOT dead —
+		// treat it as up instead of killStack()ing a healthy stack and rebooting.
+		if (!st.alive && !udpPortListening(SCSYNTH_PORT)) {
 			// NOTE: do NOT wait on OSC /status replies here. While sclang churns
 			// through its startup (synthdef compile + 450MB sample read), scsynth's
 			// stdout pipe backs up into the busy interpreter and scsynth stops
@@ -469,8 +472,16 @@ export default function (pi: ExtensionAPI) {
 		description: "Report livecoding stack state: scsynth (alive, synth count), SuperDirt port, REPL state.",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			const sc = await queryScsynth();
+			let sc = await queryScsynth();
 			scsynthCached = sc;
+			let ensureNote = "";
+			if (!sc.alive) {
+				// scsynth may just be in its post-boot UDP-silent window, or down for
+				// real — bring the stack up before trusting a DOWN report
+				ensureNote = await ensureStack(ctx.cwd);
+				sc = await queryScsynth();
+				scsynthCached = sc;
+			}
 			const dirt = udpPortListening(SUPERDIRT_PORT);
 			const replUp = !!replProc && replReady;
 			updateWidget();
@@ -480,11 +491,9 @@ export default function (pi: ExtensionAPI) {
 				`repl: ${replUp ? "ready" : replProc ? "booting" : "down"}${replUp ? ` (${Math.round((Date.now() - replBootedAt) / 1000)}s)` : ""}`,
 				`last eval: ${lastLabel}`,
 			];
+			if (ensureNote) parts.push(`(ensure: ${ensureNote})`);
 			if (!sc.alive && sclangTail.length > 0) {
 				parts.push("sclang tail:\n" + sclangTail.slice(-8).join("\n"));
-			}
-			if (!sc.alive || !dirt || !replUp) {
-				parts.push(`(run ensure: ${await ensureStack(ctx.cwd)})`);
 			}
 			return { content: [{ type: "text", text: parts.join("\n") }], details: {} };
 		},

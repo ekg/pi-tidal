@@ -18,9 +18,13 @@ This is an example startup file. You can load it from your startup file
 	s.waitForBoot {
 		~dirt.stop; // stop any old ones, avoid duplicate dirt (if it is nil, this won't do anything)
 		~dirt = SuperDirt(2, s); // two output channels, increase if you want to pan across more channels
+		// lazy loading: register banks but read files on first use. This MUST come
+		// before any loadSoundFiles call — eagerly reading the full Dirt-Samples
+		// tree (~450 MB of buffers in one burst) crashes scsynth under pipewire-jack
+		// with a clean "Server exited with exit code 0" a few seconds after boot.
+		~dirt.doNotReadYet = true;
 		~dirt.loadSoundFiles;   // load samples (path containing a wildcard can be passed in)
 		// for example: ~dirt.loadSoundFiles("/Users/myUserName/Dirt/samples/*");
-		~dirt.doNotReadYet = true;
         ~dirt.loadSoundFiles("/home/erik/sounds/*");
         ~dirt.loadSoundFiles("/home/erik/sounds/mars_symlinks/*");
 		// s.sync; // optionally: wait for samples to be read
