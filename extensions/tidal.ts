@@ -42,6 +42,13 @@ export default function (pi: ExtensionAPI) {
 	let replStdoutBuf = "";
 	let watchdog: ReturnType<typeof setInterval> | null = null;
 
+	// ---------- recording state ----------
+	let recActive = false;
+	let recVia: "sclang" | "pw" | null = null;
+	let recPath = "";
+	let recStartedAt = 0;
+	let pwRecProc: cp.ChildProcess | null = null;
+
 	// ---------- OSC / scsynth ----------
 	function pad(b: Buffer): Buffer {
 		return Buffer.concat([b, Buffer.alloc((4 - (b.length % 4)) % 4)]);
@@ -265,6 +272,111 @@ export default function (pi: ExtensionAPI) {
 		}, 10_000);
 	}
 
+	// ---------- recording ----------
+	// Preferred path: scsynth records its own output bus via s.record — a clean
+	// pre-mixer tap with no system audio (browser, notifications) and no
+	// clipping from the user's output volume. Fallback: pw-record on the
+	// default sink's monitor (post-volume, may clip, may capture system audio).
+	function defaultSinkNode(): string | null {
+		try {
+			const out = cp.execSync("wpctl status", { encoding: "utf-8" });
+			let inSinks = false;
+			for (const l of out.split("\n")) {
+				if (/Sinks:/.test(l)) { inSinks = true; continue; }
+				if (!inSinks) continue;
+				if (/endpoints:|Sources:|Devices:/.test(l)) break;
+				const m = l.match(/\*\s*(\d+)\./);
+				if (m) return m[1];
+			}
+		} catch { /* wpctl missing or no default */ }
+		return null;
+	}
+
+	function markerPath(): string {
+		return recPath.replace(/\.wav$/, ".markers.jsonl");
+	}
+
+	function writeMarker(label: string): void {
+		try {
+			let git = "";
+			try {
+				git = cp.execSync("git rev-parse --short HEAD", {
+					cwd: path.dirname(recPath), encoding: "utf-8",
+				}).trim();
+			} catch { /* not a repo */ }
+			fs.appendFileSync(markerPath(), JSON.stringify({
+				t: new Date().toISOString(),
+				rel: Math.round((Date.now() - recStartedAt) / 100) / 10,
+				label,
+				last: lastLabel,
+				git,
+			}) + "\n");
+		} catch { /* best effort */ }
+	}
+
+	async function startRecording(cwd: string): Promise<string> {
+		if (recActive) return `already recording: ${recPath}`;
+		const stackMsg = await ensureStack(cwd);
+		if (!stackMsg.includes("ready")) return `cannot record: ${stackMsg}`;
+		const dir = path.join(cwd, "recordings");
+		try { fs.mkdirSync(dir, { recursive: true }); } catch { /* exists */ }
+		const d = new Date();
+		const pad = (n: number) => String(n).padStart(2, "0");
+		const name = `jam-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+		recPath = path.join(dir, name + ".wav");
+		recStartedAt = Date.now();
+		recVia = null;
+		if (sclangProc?.stdin) {
+			try {
+				sclangProc.stdin.write(
+				// sched(2) is load-bearing: calling s.record immediately after
+				// prepareForRecord races the Recorder's temp DiskOut synthdef to the
+				// server ("SynthDef temp__0 not found") and yields a header-only file
+				`s.recHeaderFormat = "wav"; s.prepareForRecord(${JSON.stringify(recPath)}); SystemClock.sched(2, { s.record });\n`);
+			await new Promise((r) => setTimeout(r, 3000));
+				if (fs.existsSync(recPath) && fs.statSync(recPath).size > 44) recVia = "sclang";
+			} catch { /* fall through to pw-record */ }
+		}
+		if (!recVia) {
+			const sink = defaultSinkNode();
+			if (sink) {
+				pwRecProc = cp.spawn("pw-record", ["--target", sink, "--rate", "48000", "--channels", "2", "--format", "f32", recPath], { stdio: "ignore" });
+				pwRecProc.on("exit", () => { pwRecProc = null; });
+				await new Promise((r) => setTimeout(r, 1000));
+				if (fs.existsSync(recPath) && fs.statSync(recPath).size > 44) recVia = "pw";
+				else pwRecProc = null;
+			}
+		}
+		if (!recVia) return "could not start recording (sclang s.record and pw-record both failed)";
+		recActive = true;
+		writeMarker("start");
+		updateWidget(`recording: ${path.basename(recPath)}`);
+		return `recording to ${recPath} (via ${recVia})`;
+	}
+
+	async function stopRecording(transcode = true): Promise<string> {
+		if (!recActive) return "not recording";
+		recActive = false;
+		writeMarker("stop");
+		if (recVia === "sclang" && sclangProc?.stdin) {
+			try { sclangProc.stdin.write("s.stopRecording;\n"); } catch { /* gone */ }
+		} else if (recVia === "pw" && pwRecProc) {
+			try { pwRecProc.kill("SIGINT"); } catch { /* gone */ }
+		}
+		await new Promise((r) => setTimeout(r, 1500));
+		const dur = Math.round((Date.now() - recStartedAt) / 100) / 10;
+		let extra = "";
+		if (transcode && fs.existsSync("/usr/bin/ffmpeg") && fs.existsSync(recPath) && fs.statSync(recPath).size > 44) {
+			try {
+				cp.execFileSync("/usr/bin/ffmpeg", ["-y", "-i", recPath, "-c:a", "flac", markerPath().replace(/\.markers\.jsonl$/, ".flac")], { stdio: "ignore" });
+				extra = " (+flac)";
+			} catch { /* keep wav only */ }
+		}
+		const size = fs.existsSync(recPath) ? Math.round(fs.statSync(recPath).size / 1e6) : 0;
+		updateWidget(`recording stopped: ${Math.round(dur)}s`);
+		return `stopped after ${dur}s, ${size}MB: ${recPath}${extra} | markers: ${markerPath()}`;
+	}
+
 	function teardown(): void {
 		if (watchdog) { clearInterval(watchdog); watchdog = null; }
 		if (replProc) { try { replProc.kill("SIGTERM"); } catch { /* gone */ } }
@@ -407,6 +519,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		if (recActive) await stopRecording(false);
 		teardown();
 	});
 
@@ -501,9 +614,32 @@ export default function (pi: ExtensionAPI) {
 
 	// ---------- command ----------
 	pi.registerCommand("tidal", {
-		description: "tidal stack: /tidal [status|hush|restart]",
+		description: "tidal stack: /tidal [status|hush|restart|record start|record stop|mark <label>]",
 		handler: async (args, ctx) => {
 			const arg = (args || "status").trim();
+			if (arg === "record" || arg.startsWith("record ")) {
+				const sub = arg.slice(6).trim() || "status";
+				if (sub === "start") {
+					ctx.ui.notify("tidal: " + await startRecording(ctx.cwd), "info");
+				} else if (sub === "stop") {
+					ctx.ui.notify("tidal: " + await stopRecording(), "info");
+				} else {
+					ctx.ui.notify(recActive
+						? `tidal: recording ${path.basename(recPath)} via ${recVia}, ${Math.round((Date.now() - recStartedAt) / 1000)}s`
+						: "tidal: not recording", "info");
+				}
+				return;
+			}
+			if (arg === "mark" || arg.startsWith("mark ")) {
+				const label = arg.slice(4).trim();
+				if (!recActive) {
+					ctx.ui.notify("tidal: not recording — /tidal record start first", "error");
+					return;
+				}
+				writeMarker(label || "mark");
+				ctx.ui.notify(`tidal: marked "${label || "mark"}" at ${Math.round((Date.now() - recStartedAt) / 100) / 10}s`, "info");
+				return;
+			}
 			if (arg === "hush") {
 				if (sendChunk("hush")) ctx.ui.notify("tidal: hush sent", "info");
 				else ctx.ui.notify("tidal: repl not ready", "error");

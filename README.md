@@ -93,3 +93,17 @@ sc/superdirt_startup.scd  battle-tested SuperDirt boot (waitForBoot, no s.reboot
 ## License
 
 MIT
+
+## Recording
+
+`/tidal record start` captures the stack's output via `s.record` (a clean
+scsynth tap: no system audio, no output-volume clipping; falls back to
+`pw-record` on the default sink's monitor if that fails). Files land in
+`<project>/recordings/jam-YYYYMMDD-HHMM.wav`, and a FLAC copy is written on
+`/tidal record stop` (when ffmpeg is available).
+
+`/tidal mark <label>` stamps the recording's sidecar
+`jam-....markers.jsonl` with a timestamp, the current eval label, and the
+project's `git HEAD` at that moment — so markers, commit history and audio
+can be cross-referenced after the set. Recording auto-stops on session
+shutdown.
