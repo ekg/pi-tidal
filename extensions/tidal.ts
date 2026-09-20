@@ -536,6 +536,50 @@ export default function (pi: ExtensionAPI) {
 
 	// ---------- tools ----------
 	pi.registerTool({
+		name: "tidal_record",
+		label: "Tidal Record",
+		description:
+			"Start/stop recording the stack's audio output. Preferred over shelling out to pw-record: " +
+			"uses s.record (clean scsynth tap, no system audio or output-volume clipping), writes " +
+			"recordings/jam-YYYYMMDD-HHMM.wav plus a FLAC copy on stop, and maintains a markers sidecar. " +
+			"Use start before a take and stop when it's over; recording auto-stops on session shutdown.",
+		parameters: Type.Object({
+			action: Type.Union([Type.Literal("start"), Type.Literal("stop"), Type.Literal("status")], {
+				description: "start, stop, or query recording state",
+			}),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			let msg: string;
+			if (params.action === "start") msg = await startRecording(ctx.cwd);
+			else if (params.action === "stop") msg = await stopRecording();
+			else msg = recActive
+				? `recording ${path.basename(recPath)} via ${recVia}, ${Math.round((Date.now() - recStartedAt) / 1000)}s`
+				: "not recording";
+			return { content: [{ type: "text", text: msg }], details: {} };
+		},
+	});
+
+	pi.registerTool({
+		name: "tidal_mark",
+		label: "Tidal Mark",
+		description:
+			"Stamp a labeled marker into the current recording's markers sidecar (<jam>.markers.jsonl): " +
+			"timestamp, seconds into the take, current eval label, and the project's git HEAD. " +
+			"Call at musical transitions ('drop', 'breakdown', 'climax') so the audio can be " +
+			"cross-referenced with the commit history afterwards. Requires an active recording.",
+		parameters: Type.Object({
+			label: Type.String({ description: "Short marker label, e.g. 'drop', 'breakdown', 'pianos back'" }),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			if (!recActive) {
+				return { content: [{ type: "text", text: "not recording — use tidal_record action=start first" }], details: {} };
+			}
+			writeMarker(params.label);
+			return { content: [{ type: "text", text: `marked "${params.label}" at ${Math.round((Date.now() - recStartedAt) / 100) / 10}s` }], details: {} };
+		},
+	});
+
+	pi.registerTool({
 		name: "tidal_eval",
 		label: "Tidal Eval",
 		description:

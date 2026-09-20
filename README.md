@@ -107,3 +107,7 @@ scsynth tap: no system audio, no output-volume clipping; falls back to
 project's `git HEAD` at that moment — so markers, commit history and audio
 can be cross-referenced after the set. Recording auto-stops on session
 shutdown.
+
+The agent can drive this itself via the `tidal_record` (start/stop/status)
+and `tidal_mark` tools, so it can record a take and stamp transitions
+without human commands.
