@@ -5,7 +5,7 @@
 // - Auto-evaluates changed chunks of *.tidal files after pi write/edit calls
 //   (chunks = blank-line separated blocks, per the repo README convention).
 // - Feeds REPL errors back into the agent context as user messages.
-// - Tools: tidal_eval, tidal_hush, tidal_status. Command: /tidal.
+// - Tools: tidal_eval, tidal_hush, tidal_state, tidal_status. Command: /tidal.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -170,13 +170,16 @@ export default function (pi: ExtensionAPI) {
 		replBootedAt = Date.now();
 		replProc = cp.spawn("ghci", ["-ghci-script", boot], { cwd, stdio: ["pipe", "pipe", "pipe"] });
 		stderrLines = [];
+		errorBurst = null;
+		if (errorFlushTimer) { clearTimeout(errorFlushTimer); errorFlushTimer = null; }
 		replStdoutBuf = "";
 		replProc.stdout?.on("data", (d: Buffer) => {
 			const text = d.toString();
 			dbg("repl stdout:", JSON.stringify(text.slice(0, 80)));
 			// ghci stdout arrives in tiny pipe-sized fragments; match against a
-			// rolling buffer, not individual chunks
-			replStdoutBuf = (replStdoutBuf + text).slice(-600);
+			// rolling buffer, not individual chunks (large enough to hold a full
+			// 'list' capture for replQuery)
+			replStdoutBuf = (replStdoutBuf + text).slice(-4000);
 			if (!replReady && /Connected to SuperDirt|Listening for external controls/.test(replStdoutBuf)) {
 				replReady = true;
 				flushQueue();
@@ -377,17 +380,23 @@ export default function (pi: ExtensionAPI) {
 		return `stopped after ${dur}s, ${size}MB: ${recPath}${extra} | markers: ${markerPath()}`;
 	}
 
-	function teardown(): void {
+	function teardown(reason?: string): void {
 		if (watchdog) { clearInterval(watchdog); watchdog = null; }
 		if (replProc) { try { replProc.kill("SIGTERM"); } catch { /* gone */ } }
-		if (sclangProc) {
-			try { sclangProc.kill("SIGTERM"); } catch { /* gone */ }
-			setTimeout(() => {
-				// the systemd-inhibit wrapper does not forward signals to sclang,
-				// so make sure no orphans survive teardown
-				try { cp.execSync("pkill -u $USER -x sclang", { stdio: "ignore" }); } catch { /* none */ }
-				try { cp.execSync("pkill -u $USER -x scsynth", { stdio: "ignore" }); } catch { /* none */ }
-			}, 1500);
+		// ghci must die (a fresh instance takes over scheduling), but on session
+		// transitions that keep pi running — /reload, new/resume/fork — leave the
+		// SuperDirt stack (sclang + scsynth) up so samples stay loaded and the
+		// next session boots instantly. Only a real quit tears everything down.
+		if (!reason || reason === "quit") {
+			if (sclangProc) {
+				try { sclangProc.kill("SIGTERM"); } catch { /* gone */ }
+				setTimeout(() => {
+					// the systemd-inhibit wrapper does not forward signals to sclang,
+					// so make sure no orphans survive teardown
+					try { cp.execSync("pkill -u $USER -x sclang", { stdio: "ignore" }); } catch { /* none */ }
+					try { cp.execSync("pkill -u $USER -x scsynth", { stdio: "ignore" }); } catch { /* none */ }
+				}, 1500);
+			}
 		}
 		replProc = null;
 		sclangProc = null;
@@ -459,37 +468,65 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// ---------- error feedback ----------
+	// GHC emits a single error across several stderr writes: the header line
+	// (<interactive>:N:M: error:) arrives first, the message body (bullets,
+	// source context) in later chunks. Reporting on the first matching line
+	// produces empty-bodied reports, and excerpting the stderr ring-buffer tail
+	// pulls in stale fragments from older errors. So: on the first matching
+	// line, open a burst that accumulates everything until stderr goes quiet
+	// for a beat, then report once with the complete burst as the excerpt.
+	let errorBurst: string[] | null = null;
+	let errorFlushTimer: ReturnType<typeof setTimeout> | null = null;
+	const ERROR_QUIET_MS = 400;
+
+	function flushErrorBurst(): void {
+		errorFlushTimer = null;
+		const burst = errorBurst;
+		errorBurst = null;
+		if (!burst || !replReady) return;
+		const now = Date.now();
+		// hard cooldown: at most one error report per 30s. GHC errors carry
+		// fresh line numbers (<interactive>:23:5) on every attempt, so naive
+		// content dedupe never matches and each failed eval spawns a new
+		// [tidal] message — which makes the agent react and re-eval, flooding
+		// the session with an eval-error-response loop.
+		if (now - lastErrorAt < 30_000) return;
+		// normalize line numbers out before dedupe so the same error re-fired
+		// on chunk edits still counts as "the same error"
+		const excerpt = burst
+			.map((l) => l.replace(/<interactive>:\d+(:\d+)?(-\d+)?:?/g, "<interactive>").trimEnd())
+			.filter((l) => !l.trim().startsWith("--") && !/Suggested fix/.test(l))
+			.filter((l, i, a) => l !== "" || (i > 0 && a[i - 1] !== ""))
+			.join("\n")
+			.trim();
+		if (!excerpt) return;
+		if (excerpt === lastErrorExcerpt) return; // same error, already reported
+		lastErrorExcerpt = excerpt;
+		lastErrorAt = now;
+		updateWidget(`ERROR: ${excerpt.split("\n")[0].slice(0, 60)}`);
+		pi.sendUserMessage(
+			`[tidal] REPL error after evaluating ${lastLabel}:\n\`\`\`\n${excerpt}\n\`\`\`\nFix the chunk and re-save it.`,
+			{ deliverAs: "followUp" },
+		);
+	}
+
 	function handleStderr(text: string): void {
 		for (const line of text.split("\n")) {
 			stderrLines.push(line);
 			if (stderrLines.length > 60) stderrLines.shift();
 			if (!replReady) continue; // ignore ghci boot noise
-			if (!/(error|Exception|not in scope|parse error|Cannot interpolate|Variable not)/i.test(line)) continue;
-			if (line.trim().startsWith("--") || /Suggested fix/.test(line)) continue;
-
-			const now = Date.now();
-			// hard cooldown: at most one error report per 30s. GHC errors carry
-			// fresh line numbers (<interactive>:23:5) on every attempt, so naive
-			// content dedupe never matches and each failed eval spawns a new
-			// [tidal] message — which makes the agent react and re-eval, flooding
-			// the session with an eval-error-response loop.
-			if (now - lastErrorAt < 30_000) continue;
-
-			// normalize line numbers out before dedupe so the same error re-fired
-			// on chunk edits still counts as "the same error"
-			const excerpt = stderrLines
-				.slice(-8)
-				.map((l) => l.replace(/<interactive>:\d+(:\d+)?(-\d+)?:?/g, "<interactive>").trim())
-				.filter((l, i, a) => l !== "" || (i > 0 && a[i - 1] !== ""))
-				.join("\n");
-			if (excerpt === lastErrorExcerpt) continue; // same error, already reported
-			lastErrorExcerpt = excerpt;
-			lastErrorAt = now;
-			updateWidget(`ERROR: ${line.trim().slice(0, 60)}`);
-			pi.sendUserMessage(
-				`[tidal] REPL error after evaluating ${lastLabel}:\n\`\`\`\n${excerpt}\n\`\`\`\nFix the chunk and re-save it.`,
-				{ deliverAs: "followUp" },
-			);
+			const matches = /(error|Exception|not in scope|parse error|Cannot interpolate|Variable not)/i.test(line);
+			const noise = line.trim().startsWith("--") || /Suggested fix/.test(line);
+			if (errorBurst) {
+				// inside a burst: collect every line (GHC message bodies don't all
+				// match the error regex) until the quiet timer flushes
+				errorBurst.push(line);
+			} else if (matches && !noise) {
+				errorBurst = [line];
+			}
+		}
+		if (errorBurst && !errorFlushTimer) {
+			errorFlushTimer = setTimeout(flushErrorBurst, ERROR_QUIET_MS);
 		}
 	}
 
@@ -531,9 +568,10 @@ export default function (pi: ExtensionAPI) {
 		updateWidget();
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (event) => {
 		if (recActive) await stopRecording(false);
-		teardown();
+		const reason = (event as { reason?: string } | undefined)?.reason;
+		teardown(reason);
 	});
 
 	// ---------- auto-eval on edit ----------
@@ -547,7 +585,63 @@ export default function (pi: ExtensionAPI) {
 		scheduleEval(p, ctx.cwd);
 	});
 
+	// ---------- REPL output capture ----------
+	// ghci's stdout is block-buffered through the pipe; the established
+	// workaround (see startRepl) is poking stdin, which makes ghci flush its
+	// buffered output when it processes the next line. replQuery sends a
+	// marker-delimited command and pokes until the end marker shows up.
+	function replQuery(cmds: string[], timeoutMs = 3000): Promise<string> {
+		return new Promise((resolve) => {
+			if (!replProc || !replReady) return resolve("(repl not ready)");
+			const BEGIN = "__PI_TIDAL_BEGIN__", END = "__PI_TIDAL_END__";
+			const cmd = `putStrLn "${BEGIN}" >> (${cmds.join(" >> ")}) >> putStrLn "${END}"`;
+			try { replProc.stdin?.write(cmd + "\n"); } catch { return resolve("(repl stdin closed)"); }
+			const deadline = Date.now() + timeoutMs;
+			const poll = setInterval(() => {
+				const buf = replStdoutBuf;
+				const bi = buf.indexOf(BEGIN);
+				const ei = bi >= 0 ? buf.indexOf(END, bi) : -1;
+				if (bi >= 0 && ei > bi) {
+					clearInterval(poll);
+					resolve(buf.slice(bi + BEGIN.length, ei).trim());
+				} else if (Date.now() > deadline) {
+					clearInterval(poll);
+					resolve("(no output captured from REPL)");
+				} else {
+					try { replProc?.stdin?.write("\n"); } catch { /* gone */ } // flush poke
+				}
+			}, 250);
+		});
+	}
+
 	// ---------- tools ----------
+	pi.registerTool({
+		name: "tidal_state",
+		label: "Tidal State",
+		description:
+			"Inspect what is actually running in the REPL vs what is saved on disk. Queries Tidal's own " +
+			"'list' (which d-streams are active/muted/soloed) and reports the plugin's tracked .tidal files " +
+			"with chunk counts and the last eval label. Use to reconcile ad-hoc tidal_eval tweaks with the " +
+			"saved chunks so live state and files don't drift apart.",
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			const status = await ensureStack(ctx.cwd);
+			const listOut = replReady ? await replQuery(["list"]) : "(repl not ready)";
+			const files: string[] = [];
+			for (const [fp, chunks] of snapshots) {
+				const rel = path.relative(ctx.cwd, fp);
+				files.push(`${rel} (${chunks.length} chunks)`);
+			}
+			const text = [
+				`stack: ${status}`,
+				`last eval: ${lastLabel}`,
+				`active streams (from Tidal 'list'):\n${listOut}`,
+				`tracked .tidal files: ${files.length ? files.join(", ") : "(none)"}`,
+			].join("\n");
+			return { content: [{ type: "text", text }], details: {} };
+		},
+	});
+
 	pi.registerTool({
 		name: "tidal_record",
 		label: "Tidal Record",

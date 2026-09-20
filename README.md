@@ -15,7 +15,7 @@ agent: edits .tidal chunk  →  save  →  chunk auto-evaluates  →  sound chan
 
 - **Auto-eval**: `write`/`edit` on `*.tidal` files sends the changed chunk (blank-line separated blocks — the standard Tidal file convention) straight to the running GHCi REPL, wrapped in `:{ :}` so multi-line `do` blocks always parse.
 - **Error feedback**: REPL compile errors (`parse error`, `Variable not in scope`, …) are injected into the agent's context as `[tidal]` messages, so the agent fixes its own mistakes mid-session.
-- **Tools** the agent can call: `tidal_eval` (fire ad-hoc chunks), `tidal_hush` (emergency stop), `tidal_status` (synth count via OSC `/status`).
+- **Tools** the agent can call: `tidal_eval` (fire ad-hoc chunks), `tidal_hush` (emergency stop), `tidal_state` (what's actually running: active/muted/soloed streams via Tidal's `list`, plus tracked files & last eval), `tidal_status` (synth count via OSC `/status`).
 - **`/tidal` command** for the human: `status | hush | restart`.
 - **Self-healing stack**: a watchdog revives SuperDirt if the audio server dies and re-fires the recent chunks so the music resumes. On suspend-capable machines the sclang process runs under `systemd-inhibit` (block mode) so suspend can't kill audio mid-set.
 - **`/jam` prompt template**: one command that boots the stack and puts the agent into "expecting musical direction" mode.
