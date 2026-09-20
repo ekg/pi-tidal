@@ -467,9 +467,22 @@ export default function (pi: ExtensionAPI) {
 			if (!/(error|Exception|not in scope|parse error|Cannot interpolate|Variable not)/i.test(line)) continue;
 			if (line.trim().startsWith("--") || /Suggested fix/.test(line)) continue;
 
-			const excerpt = stderrLines.slice(-10).join("\n").trim();
 			const now = Date.now();
-			if (excerpt === lastErrorExcerpt && now - lastErrorAt < 20_000) continue; // rate-limit dupes
+			// hard cooldown: at most one error report per 30s. GHC errors carry
+			// fresh line numbers (<interactive>:23:5) on every attempt, so naive
+			// content dedupe never matches and each failed eval spawns a new
+			// [tidal] message — which makes the agent react and re-eval, flooding
+			// the session with an eval-error-response loop.
+			if (now - lastErrorAt < 30_000) continue;
+
+			// normalize line numbers out before dedupe so the same error re-fired
+			// on chunk edits still counts as "the same error"
+			const excerpt = stderrLines
+				.slice(-8)
+				.map((l) => l.replace(/<interactive>:\d+(:\d+)?(-\d+)?:?/g, "<interactive>").trim())
+				.filter((l, i, a) => l !== "" || (i > 0 && a[i - 1] !== ""))
+				.join("\n");
+			if (excerpt === lastErrorExcerpt) continue; // same error, already reported
 			lastErrorExcerpt = excerpt;
 			lastErrorAt = now;
 			updateWidget(`ERROR: ${line.trim().slice(0, 60)}`);
