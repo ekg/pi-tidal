@@ -37,7 +37,8 @@ export default function (pi: ExtensionAPI) {
 	let lastErrorAt = 0;
 	let stderrLines: string[] = [];
 	let sclangTail: string[] = []; // ring buffer of sclang stdout for diagnosis
-	let lastChunks: string[] = []; // recently sent chunks, re-fired after revival
+	let lastChunks: string[] = []; // recent non-stream chunks (hush/setcps/do-blocks), re-fired after revival
+	const streamChunks = new Map<string, string>(); // "d4" -> latest chunk for that stream (incl. silences)
 	let bootTailLen = 0; // sclangTail index where the current boot started
 	let replStdoutBuf = "";
 	let watchdog: ReturnType<typeof setInterval> | null = null;
@@ -261,11 +262,18 @@ export default function (pi: ExtensionAPI) {
 				const msg = await ensureStack(cwd);
 				lastReviveAt = Date.now();
 				if (msg.includes("ready")) {
-					// re-fire recent chunks so patterns lost to the resume come back
+					// restore state: globals first (hush/setcps/do-blocks), then each
+					// stream's latest chunk in numeric order — silences stay silent
 					for (const c of [...lastChunks]) {
 						if (replReady) sendChunk(c);
 					}
-					updateWidget("stack revived + patterns re-fired");
+					const streams = [...streamChunks.entries()].sort(
+						(a, b) => (parseInt(a[0].slice(1)) || 0) - (parseInt(b[0].slice(1)) || 0),
+					);
+					for (const [, c] of streams) {
+						if (replReady) sendChunk(c);
+					}
+					updateWidget("stack revived + state restored");
 				} else {
 					updateWidget(`revive failed: ${msg.slice(0, 40)}`);
 				}
@@ -415,8 +423,16 @@ export default function (pi: ExtensionAPI) {
 		if (!replProc?.stdin || !replReady) return false;
 		const wrapped = ":{\n" + chunk + "\n:}\n";
 		replProc.stdin.write(wrapped);
-		lastChunks.push(chunk);
-		if (lastChunks.length > 12) lastChunks.shift();
+		// track state per stream: a later "d4 $ silence" must override an earlier
+		// "d4 $ ..." chunk, so revival restores what is ACTUALLY playing instead
+		// of resurrecting long-replaced patterns (this bug kept a silenced piano
+		// coming back after every ghci revival)
+		const sm = chunk.match(/^\s*d(\d+)\s*\$/);
+		if (sm) streamChunks.set(`d${sm[1]}`, chunk);
+		else {
+			lastChunks.push(chunk);
+			if (lastChunks.length > 12) lastChunks.shift();
+		}
 		return true;
 	}
 
