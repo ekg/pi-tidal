@@ -207,7 +207,8 @@ export default function (pi: ExtensionAPI) {
 		return sclangTail.slice(bootTailLen).some((l) => l.includes("exited with exit code"));
 	}
 
-	async function ensureStack(cwd: string): Promise<string> {
+	// Real implementation (may block while a stack boots).
+	async function ensureStackInner(cwd: string): Promise<string> {
 		const st = await queryScsynth();
 		// scsynth is UDP-silent for 30-90s after spawn (README: pipe backpressure
 		// while sclang churns). If the port is bound the server is NOT dead —
@@ -636,6 +637,24 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// ---------- tools ----------
+	// Bounded wrapper: an unbounded wait here makes EVERY tidal_* tool hang with no
+	// result (observed when sclang could not initialise audio because an orphaned
+	// scsynth held the device — the plugin kept waiting for a stack that could
+	// never come up). Fail loudly with a diagnosis instead.
+	async function ensureStack(cwd: string): Promise<string> {
+		const timeout = new Promise<string>((resolve) =>
+			setTimeout(() => resolve(
+				"stack did not become ready within 120s.\n" +
+				"diagnose from a shell:\n" +
+				"  pgrep -a sclang; pgrep -a scsynth\n" +
+				"  tail -20 sc/boot.log\n" +
+				"  ss -lnup | grep -E '57110|57120'\n" +
+				"if sclang is missing or dying, kill leftovers and start it as:\n" +
+				"  pkill -u $USER -x sclang; pkill -u $USER -x scsynth; pw-jack sclang"),
+				120_000));
+		return Promise.race([ensureStackInner(cwd), timeout]);
+	}
+
 	pi.registerTool({
 		name: "tidal_state",
 		label: "Tidal State",
