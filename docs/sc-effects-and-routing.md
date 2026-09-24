@@ -113,7 +113,15 @@ into `~masterBus`, *hearing anything at all* means the chain is in the path.
    params this layer uses are declared in **`livecode/BootTidal.hs`** (the plugin
    prefers a project-local boot file), so they are in scope on every REPL start.
 
-8. **After restarting the audio stack, restart the Tidal REPL too.** Killing
+8. **In a ghci script, put each `let` binding on its own line.** A multi-line
+   `let` block in `BootTidal.hs` (first binding on the `let` line, the rest
+   indented underneath) is parsed as separate commands when loaded via
+   `-ghci-script`: the continuations fail, every following binding is dropped,
+   and the REPL comes up looking completely healthy while none of the custom
+   params exist. Symptom: `Variable not in scope: ddSend`, with no indication
+   that the boot file was the problem. One `let x = ...` per line, always.
+
+9. **After restarting the audio stack, restart the Tidal REPL too.** Killing
    sclang/scsynth and letting the plugin respawn them leaves ghci's OSC path
    dead: `tidal_state` still reports streams as active and evals appear to work,
    but no events arrive (`/g_queryTree` shows no new nodes) and there is total
