@@ -746,6 +746,73 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+
+	pi.registerTool({
+		name: "tidal_param",
+		label: "Declare Tidal Parameters",
+		description:
+			"Declare SuperDirt parameters in the running Tidal REPL so patterns can " +
+			"send them (without this an eval fails with 'Variable not in scope'). " +
+			"Takes specs like 'ddSend:f mSat:f lock:i', where f/i/s pick pF/pI/pS. " +
+			"For a permanent declaration add the param to livecode/sc/params.tsv and run " +
+			"tools/sc_params.py, which regenerates BootTidal.hs.",
+		parameters: Type.Object({
+			spec: Type.String({ description: "space separated name[:type] specs" }),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const status = await ensureStack(ctx.cwd);
+			if (!status.includes("ready")) {
+				return { content: [{ type: "text", text: `tidal_param failed: ${status}` }], details: {} };
+			}
+			const fn = (t: string) => (t === "i" ? "pI" : t === "s" ? "pS" : "pF");
+			const specs = params.spec.trim().split(/\s+/).filter(Boolean);
+			let n = 0;
+			for (const spec of specs) {
+				const [name, typ = "f"] = spec.split(":");
+				if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
+				if (!sendChunk(`let ${name} = ${fn(typ)} "${name}"`)) queuedChunks.push(`let ${name} = ${fn(typ)} "${name}"`);
+				n++;
+			}
+			lastLabel = "tidal_param";
+			updateWidget(`declare ${n} param(s)`);
+			return { content: [{ type: "text", text: `declared ${n} parameter(s): ${specs.join(" ")}` }], details: {} };
+		},
+	});
+
+	pi.registerTool({
+		name: "tidal_repl",
+		label: "Restart Tidal REPL",
+		description:
+			"Restart the Tidal (ghci) REPL so it reloads BootTidal.hs, and by doing so " +
+			"re-establish the OSC path to SuperDirt. Needed after the audio stack is " +
+			"restarted (the old REPL looks healthy and reports active streams while " +
+			"sending nothing), and after editing BootTidal.hs. Patterns do not survive.",
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			// the binary is ghc-9.4.7, NOT ghci — matching 'ghci' silently does nothing,
+			// which cost hours. Match the boot file on the command line instead.
+			let killed = 0;
+			try {
+				const pids = cp.execSync(
+					"ps -eo pid,args | awk '/ghci-scri/ && !/awk/ {print $1}'",
+					{ encoding: "utf8" }).trim().split(/\s+/).filter(Boolean);
+				for (const pid of pids) {
+					try { cp.execSync(`kill ${pid}`); killed++; } catch { /* gone */ }
+				}
+			} catch { /* none found */ }
+			replProc = null;
+			replReady = false;
+			// respawn immediately so the next eval does not wait on a cold start
+			startRepl(ctx.cwd);
+			lastLabel = "tidal_repl";
+			updateWidget("repl restarting");
+			return {
+				content: [{ type: "text", text: `killed ${killed} REPL process(es); new REPL loading BootTidal.hs (patterns must be re-sent)` }],
+				details: {},
+			};
+		},
+	});
+
 	pi.registerTool({
 		name: "tidal_eval",
 		label: "Tidal Eval",
