@@ -169,6 +169,11 @@ export default function (pi: ExtensionAPI) {
 		}
 		replReady = false;
 		replBootedAt = Date.now();
+		// a fresh REPL has none of the previous process's state, so anything queued
+		// for the old one is stale: flushing it produces bursts of
+		// "Variable not in scope" for declarations that were made in the old REPL
+		// (and for params that no longer exist at all)
+		queuedChunks.length = 0;
 		replProc = cp.spawn("ghci", ["-ghci-script", boot], { cwd, stdio: ["pipe", "pipe", "pipe"] });
 		stderrLines = [];
 		errorBurst = null;
