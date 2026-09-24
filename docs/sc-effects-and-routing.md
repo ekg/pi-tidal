@@ -135,34 +135,17 @@ self-test measures the master chain itself (`synth → ~masterBus → Ndef → b
 so a dead chain is reported as a number in `sc/boot.log` rather than as mystery
 silence.
 
-## Open bug: the master-control bridge (m* params)
+## Resolved by removal: the Tidal-side master controls (m* params)
 
-State as of 2026-09-24, so this is not re-derived from scratch:
-
-- **Verified working**: the SC layer boots clean; the boot self-test measures every
-  instrument *and* the master chain (`sc/boot.log`); stock Tidal params play; the
-  custom instruments play (`s "dubchord" # n "c3"`); the per-orbit sends
-  (dd*/verb*) demonstrably produce long, darkening tails.
-- **Not working**: `mGain` (and by extension the other `m*` master params) has no
-  audible effect. A pattern carrying them compiles (no "not in scope") and the
-  audio is unchanged: `bd*4` at gain 1.0 measures peak 1.000 both with and
-  without `# mGain 0.3`, where 0.3 should read ~0.30.
-
-Mechanism, for whoever picks this up: Tidal param → `dirt_masterctl` global
-effect → writes `~masterCtlBus` (control bus) → `Ndef(\dubMaster)` reads it and
-applies gain/glue/sat/cut/duck. Suspects, in order:
-
-1. `dirt_masterctl` is never actually running. GlobalDirtEffect synths are created
-   *paused*; `alwaysRun_(true)` has been applied (commit 4e480ed) but that was
-   not sufficient on its own — verify with `~dirt.orbits[0].globalEffects.detect
-   { |e| e.name == \dirt_masterctl }.synth` and by reading the bus value.
-2. Control-bus index mismatch: the bus index is baked into the SynthDef at build
-   time (`Out.kr(ctl.index, ...)`) and read at Ndef build time. Log both in
-   `init.scd`, and read the bus with `~masterCtlBus.getSynchronous(0)` after boot.
-3. The array write/read offsets: `Out.kr(bus, [8 values])` writes bus..bus+7 and
-   the Ndef reads `In.kr(ctl + 0..7)`; confirm with `/c_get` over OSC.
-
-Cheapest workaround until it is fixed: keep the master controls in SuperCollider
-(set them from sclang, or via the `tidal_sc` tool once loaded) and drive only the
-per-orbit sends from Tidal. The backend itself is fine — this is the *control
-path* from Tidal, not the DSP.
+The master-control bridge (Tidal `m*` params -> `dirt_masterctl` -> control bus ->
+`Ndef(\dubMaster)`) never worked reliably: with the chain's gain bus seeded to 0.3
+at boot a gain-1.0 kick still measured 0.286 (vs 0.321 at gain 1.0), and
+`# mGain 0.35` changed nothing (0.320 vs 0.321). `alwaysRun_(true)` was necessary
+(GlobalDirtEffect synths are created paused) but not sufficient, so the fault is
+on the reading side. **Decision: removed.** The master is configured in
+`sc/dub_master.scd` and the music is driven through the verified per-orbit sends
+(`dd*`, `verb*`, `tape*`) and instrument voicing. `dirt_masterctl` is gone from
+the orbit chain and the `m*` group from `sc/params.tsv`, so nothing advertises a
+parameter that does nothing. To reinstate Tidal-side master control later, use a
+plain Synth reading the bus and writing `Ndef` controls instead of baking the bus
+index into the Ndef's function.
