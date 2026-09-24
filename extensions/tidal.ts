@@ -818,6 +818,87 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+
+	pi.registerTool({
+		name: "tidal_sc_reload",
+		label: "Reload SuperCollider Layer",
+		description:
+			"Re-execute the project's SuperCollider DSP layer (livecode/sc/init.scd) in " +
+			"the running sclang, so changes to SynthDefs, routing, effects and instruments " +
+			"take effect WITHOUT restarting the audio stack (a restart costs 60-90s). " +
+			"Use after editing anything in sc/. Reinstalls orbit effect chains and re-routes " +
+			"orbits, so expect effects synths to be recreated.",
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			const status = await ensureStack(ctx.cwd);
+			if (!status.includes("ready")) {
+				return { content: [{ type: "text", text: `tidal_sc_reload failed: ${status}` }], details: {} };
+			}
+			if (!sclangProc || !sclangProc.stdin) {
+				return { content: [{ type: "text", text: "tidal_sc_reload: no sclang stdin available" }], details: {} };
+			}
+			const mark = sclangTail.length;
+			const sc = `${ctx.cwd}/sc/init.scd`;
+			try {
+				sclangProc.stdin.write(`(\n"--- reloading ${sc}".postln;\nthis.executeFile("${sc}");\n)\n`);
+			} catch (e) {
+				return { content: [{ type: "text", text: `tidal_sc_reload: write failed: ${e}` }], details: {} };
+			}
+			await new Promise((r) => setTimeout(r, 2500));
+			const out = sclangTail.slice(mark).join("\n").trim();
+			lastLabel = "tidal_sc_reload";
+			updateWidget("reload sc layer");
+			return { content: [{ type: "text", text: out || "(sent; sc/boot.log records the stages)" }], details: {} };
+		},
+	});
+
+	pi.registerTool({
+		name: "tidal_sc_status",
+		label: "SuperCollider Status",
+		description:
+			"Report the SuperCollider side as text: orbit -> bus routing, each orbit's " +
+			"effect chain, master/aux send levels, plus the last lines of sc/boot.log " +
+			"(which records self-test levels for every instrument and the master chain). " +
+			"Use it to see the routing instead of guessing.",
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			const status = await ensureStack(ctx.cwd);
+			if (!status.includes("ready")) {
+				return { content: [{ type: "text", text: `tidal_sc_status failed: ${status}` }], details: {} };
+			}
+			let log = "";
+			try {
+				const logPath = `${ctx.cwd}/sc/boot.log`;
+				if (fs.existsSync(logPath)) {
+					const lines = fs.readFileSync(logPath, "utf8").trim().split("\n");
+					log = lines.slice(-12).join("\n");
+				}
+			} catch { /* no log yet */ }
+			let live = "";
+			if (sclangProc?.stdin) {
+				const mark = sclangTail.length;
+				try {
+					sclangProc.stdin.write(
+						'(\n"--- sc state ---".postln;\n' +
+						'~dirt.orbits.do { |o, i| ("  orbit % -> bus %  fx: %".format(i, o.outBus.asString, ' +
+						'o.globalEffects.collect { |e| e.name.asString }.join(" -> "))).postln };\n' +
+						'if(~route.notNil) { ~route.levels.value };\n' +
+						'"--- end ---".postln;\n)\n');
+				} catch { /* gone */ }
+				await new Promise((r) => setTimeout(r, 1200));
+				live = sclangTail.slice(mark).join("\n").trim();
+			}
+			lastLabel = "tidal_sc_status";
+			updateWidget("sc status");
+			return {
+				content: [{ type: "text", text:
+					`scsynth: ${scsynthCached?.alive ? "alive" : "?"}\n\n` +
+					`live SC state:\n${live || "(no reply)"}\n\nsc/boot.log (tail):\n${log || "(none)"}` }],
+				details: {},
+			};
+		},
+	});
+
 	pi.registerTool({
 		name: "tidal_eval",
 		label: "Tidal Eval",
