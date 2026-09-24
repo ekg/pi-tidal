@@ -103,3 +103,26 @@ into `~masterBus`, *hearing anything at all* means the chain is in the path.
   DFM1) — a large synth/FX library we have barely touched.
 - Greyhole (dub-style modulated delay-verb) is available and would be a good third
   send for "shimmer" once the core setup is familiar.
+
+## Two workflow traps found while wiring this up
+
+7. **Tidal must know every custom parameter.** SuperDirt's "adding effects" recipe
+   has three steps and we had done two: define the SynthDef, register the module —
+   but not *declare the parameter in Tidal*. Without it an eval dies with
+   `Variable not in scope: ddSend` and never reaches the audio server. All the
+   params this layer uses are declared in **`livecode/BootTidal.hs`** (the plugin
+   prefers a project-local boot file), so they are in scope on every REPL start.
+
+8. **After restarting the audio stack, restart the Tidal REPL too.** Killing
+   sclang/scsynth and letting the plugin respawn them leaves ghci's OSC path
+   dead: `tidal_state` still reports streams as active and evals appear to work,
+   but no events arrive (`/g_queryTree` shows no new nodes) and there is total
+   silence. A direct `/dirt/play` OSC message from outside still makes sound,
+   which is how we localised it to Tidal's side. `pkill -x ghci` and the plugin
+   respawns a clean REPL on the next eval.
+
+Also learned: with the master gain exposed to Tidal, a stray event could zero the
+whole mix (silence, no error). The chain now clamps it (`0.25..2`), and the boot
+self-test measures the master chain itself (`synth → ~masterBus → Ndef → bus 0`)
+so a dead chain is reported as a number in `sc/boot.log` rather than as mystery
+silence.
