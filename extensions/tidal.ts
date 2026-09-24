@@ -702,6 +702,50 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+
+	pi.registerTool({
+		name: "tidal_sc",
+		label: "SuperCollider Eval",
+		description:
+			"Evaluate SuperCollider code in the running sclang (the SuperDirt process). " +
+			"Use it to define SynthDefs, patch the effects/master chain, adjust orbits, " +
+			"read server state, or reload the DSP layer (sc/init.scd) without restarting " +
+			"the audio stack. Code is written to sclang's stdin; sclang's own output for " +
+			"this eval is returned.",
+		parameters: Type.Object({
+			code: Type.String({ description: "SuperCollider code to evaluate" }),
+			settleMs: Type.Optional(Type.Number({
+				description: "ms to wait for sclang output before returning (default 900)",
+			})),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const status = await ensureStack(ctx.cwd);
+			if (!status.includes("ready")) {
+				return { content: [{ type: "text", text: `tidal_sc failed: ${status}` }], details: {} };
+			}
+			// weSpawnedSclang means the stdin pipe is ours to write to
+			if (!sclangProc || !sclangProc.stdin) {
+				return { content: [{ type: "text", text: "tidal_sc: no sclang stdin available" }], details: {} };
+			}
+			const mark = sclangTail.length;
+			const loadAndEval = `(\n${params.code}\n)\n`;
+			try {
+				sclangProc.stdin.write(loadAndEval);
+			} catch (e) {
+				return { content: [{ type: "text", text: `tidal_sc: write failed: ${e}` }], details: {} };
+			}
+			const settle = params.settleMs ?? 900;
+			await new Promise((r) => setTimeout(r, settle));
+			const out = sclangTail.slice(mark).join("\n").trim();
+			lastLabel = "tidal_sc";
+			updateWidget("eval sclang");
+			return {
+				content: [{ type: "text", text: out || "(no sclang output — eval sent; sclang errors print asynchronously)" }],
+				details: {},
+			};
+		},
+	});
+
 	pi.registerTool({
 		name: "tidal_eval",
 		label: "Tidal Eval",
