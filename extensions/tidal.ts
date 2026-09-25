@@ -168,9 +168,14 @@ export default function (pi: ExtensionAPI) {
 		// systemd-inhibit blocks suspend while the stack runs — a suspend/resume
 		// cycle kills scsynth's pipewire-jack client (clean exit(0)), which was
 		// the recurring "Server exited with exit code 0" mystery.
+		// pw-jack WRAPPER is required, not just its LD_LIBRARY_PATH: with only
+		// the env var scsynth loaded pipewire's libjack but never appeared in
+		// the pipewire graph (zero ports, silent speakers for a whole session).
 		const inhibit = fs.existsSync("/usr/bin/systemd-inhibit");
-		const cmd = inhibit ? "systemd-inhibit" : "sclang";
-		const args = inhibit ? ["--what=sleep", "--mode=block", "--who=pi-tidal", "sclang"] : [];
+		const cmd = inhibit ? "systemd-inhibit" : "pw-jack";
+		const args = inhibit
+			? ["--what=sleep", "--mode=block", "--who=pi-tidal", "pw-jack", "sclang"]
+			: ["sclang"];
 		sclangProc = cp.spawn(cmd, args, { cwd: process.cwd(), env, stdio: ["pipe", "pipe", "pipe"] });
 		weSpawnedSclang = true;
 		sclangTail = [];
