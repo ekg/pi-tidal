@@ -25,6 +25,9 @@ function dbg(...args: unknown[]) { if (DEBUG) console.error("[tidal-ext]", ...ar
 export default function (pi: ExtensionAPI) {
 	// ---------- state ----------
 	let sclangProc: cp.ChildProcess | null = null;
+	let scBootError = "";                      // last failing boot stage, if any
+	let currentCwd = process.cwd();            // for reading sc/boot.log from the probes
+	let lastStateFile: string | null = null;   // last ":script foo.tidal" we loaded
 	let replProc: cp.ChildProcess | null = null;
 	let replReady = false;
 	let weSpawnedSclang = false;
@@ -123,10 +126,22 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// ---------- stack lifecycle ----------
-	function killStack() {
-		try { cp.execSync("pkill -u $USER -x sclang", { stdio: "ignore" }); } catch { /* none running */ }
-		try { cp.execSync("pkill -u $USER -x scsynth", { stdio: "ignore" }); } catch { /* none running */ }
+	// Kill only what WE started: sclang, plus the scsynth it spawned as its child.
+	// A blind `pkill -u $USER -x sclang` (the old behaviour) kills a stack the user
+	// started and leaves the partner process orphaned — the source of the duplicate
+	// sclang / port-held-by-a-dead-stack mess.
+	function killOwnStack() {
+		if (sclangProc?.pid) {
+			const pid = sclangProc.pid;
+			try { cp.execSync(`pkill -P ${pid}`, { stdio: "ignore" }); } catch { /* none */ }
+			try { cp.execSync(`kill -TERM ${pid}`, { stdio: "ignore" }); } catch { /* gone */ }
+		}
+		if (replProc?.pid) {
+			try { cp.execSync(`kill -TERM ${replProc.pid}`, { stdio: "ignore" }); } catch { /* gone */ }
+		}
 	}
+
+	function killStack() { killOwnStack(); }
 
 	function startSclang(): void {
 		killStack();
@@ -200,7 +215,21 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function serverListeningSinceBoot(): boolean {
-		return sclangTail.slice(bootTailLen).some((l) => l.includes("listening on port 57120"));
+		// SuperDirt's port binds early; our layer finishes later and writes "done".
+		// Require BOTH, and refuse to report ready while a boot stage is failing.
+		const portUp = sclangTail.slice(bootTailLen).some((l) => l.includes("listening on port 57120"));
+		if (!portUp) return false;
+		try {
+					const boot = fs.readFileSync(path.join(currentCwd, "sc/boot.log"), "utf8").trim().split("\n");
+			const tail = boot.slice(-14);
+			if (tail.some((l) => l.includes("FAIL"))) {
+				scBootError = tail.filter((l) => l.includes("FAIL")).slice(-2).join("\n");
+				return false;                       // surfacing this is the whole point
+			}
+			return tail.some((l) => l.includes("done"));
+		} catch {
+			return true;                            // no boot.log: stock SuperDirt is fine
+		}
 	}
 
 	function serverDiedSinceBoot(): boolean {
@@ -209,6 +238,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Real implementation (may block while a stack boots).
 	async function ensureStackInner(cwd: string): Promise<string> {
+		currentCwd = cwd;
 		const st = await queryScsynth();
 		// scsynth is UDP-silent for 30-90s after spawn (README: pipe backpressure
 		// while sclang churns). If the port is bound the server is NOT dead —
@@ -224,7 +254,9 @@ export default function (pi: ExtensionAPI) {
 				const ok = await waitFor(() => serverListeningSinceBoot() || serverDiedSinceBoot(), 150_000, 2000);
 				dbg("boot wait result:", ok, "died:", serverDiedSinceBoot());
 				if (ok && !serverDiedSinceBoot()) break;
-				if (attempt === 2) return "scsynth did not boot (2 attempts); sclang tail:\n" + sclangTail.slice(-12).join("\n");
+				if (attempt === 2) return "scsynth did not boot (2 attempts)"
+					+ (scBootError ? "; failing boot stage:\n" + scBootError : "")
+					+ "; sclang tail:\n" + sclangTail.slice(-12).join("\n");
 				dbg("scsynth boot attempt failed, retrying");
 			}
 		}
@@ -959,6 +991,61 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+
+	pi.registerTool({
+		name: "tidal_restart",
+		label: "Restart the stack (atomic)",
+		description:
+			"Restart SuperCollider and the Tidal REPL as ONE operation: stop only the " +
+			"processes this plugin started (never a blind pkill), boot sclang, wait until " +
+			"sc/boot.log reports a fresh 'done' with no failing stage, restart the REPL so " +
+			"the OSC path is rebuilt, then re-send the last .tidal state so the music " +
+			"resumes by itself. Use this instead of killing processes by hand.",
+		parameters: Type.Object({
+			file: Type.Optional(Type.String({
+				description: "state file to re-send afterwards (default: the last one sent)",
+			})),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const before = fs.existsSync(path.join(ctx.cwd, "sc/boot.log"))
+				? fs.statSync(path.join(ctx.cwd, "sc/boot.log")).mtimeMs : 0;
+			killOwnStack();
+			await new Promise((r) => setTimeout(r, 2500));
+			startSclang();
+			startRepl(ctx.cwd);
+			// wait for a FRESH boot log ending in "done"
+			let ok = false;
+			for (let i = 0; i < 40; i++) {
+				await new Promise((r) => setTimeout(r, 3000));
+				try {
+					const p = path.join(ctx.cwd, "sc/boot.log");
+					if (!fs.existsSync(p) || fs.statSync(p).mtimeMs <= before) continue;
+					const tail = fs.readFileSync(p, "utf8").trim().split("\n").slice(-14);
+					if (tail.some((l) => l.includes("FAIL"))) {
+						scBootError = tail.filter((l) => l.includes("FAIL")).slice(-2).join("\n");
+						return { content: [{ type: "text", text: `restart failed at a boot stage:\n${scBootError}` }], details: {} };
+					}
+					if (tail.some((l) => l.includes("done"))) { ok = true; break; }
+				} catch { /* keep waiting */ }
+			}
+			if (!ok) {
+				return { content: [{ type: "text", text: "restart: boot never reached 'done' (see sc/boot.log)" }], details: {} };
+			}
+			let resent = "none";
+			const target = params.file ?? lastStateFile;
+			if (target) {
+				for (const chunk of fs.readFileSync(target, "utf8").split(/\n\s*\n/)) {
+					const c = chunk.trim();
+					if (c && !c.split("\n").every((l) => l.trim().startsWith("--"))) sendChunk(c);
+				}
+				resent = target;
+			}
+			lastLabel = "tidal_restart";
+			updateWidget("stack restarted");
+			return { content: [{ type: "text", text: `stack restarted (boot ok, REPL fresh); re-sent ${resent}` }], details: {} };
+		},
+	});
+
 	pi.registerTool({
 		name: "tidal_eval",
 		label: "Tidal Eval",
@@ -973,6 +1060,8 @@ export default function (pi: ExtensionAPI) {
 			if (!status.includes("ready")) {
 				return { content: [{ type: "text", text: `tidal_eval failed: ${status}` }], details: {} };
 			}
+			const scripted = params.code.match(/:script\s+(\S+\.tidal)/);
+			if (scripted) lastStateFile = scripted[1];
 			for (const chunk of params.code.split(/\n[ \t]*\n/)) {
 				const c = chunk.trim();
 				if (!c || c.split("\n").every((l) => l.trim().startsWith("--"))) continue;
