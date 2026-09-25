@@ -918,6 +918,47 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+
+	pi.registerTool({
+		name: "tidal_panic",
+		label: "Panic (silence + free nodes)",
+		description:
+			"True silence: hush the Tidal streams AND free stuck SuperCollider nodes. " +
+			"`hush` only stops *events* — a synth whose envelope never closed keeps " +
+			"droning under everything, which is a disaster live. This frees the " +
+			"SuperDirt event groups and re-initialises each orbit's effect chain, so " +
+			"the audio path is rebuilt and genuinely silent.",
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			const status = await ensureStack(ctx.cwd);
+			if (!status.includes("ready")) {
+				return { content: [{ type: "text", text: `tidal_panic: ${status}` }], details: {} };
+			}
+			sendChunk("hush");                       // stop events on the Tidal side
+			let scOut = "(no sclang stdin)";
+			if (sclangProc?.stdin) {
+				const mark = sclangTail.length;
+				try {
+					sclangProc.stdin.write(
+						'(\n"--- panic: freeing stuck nodes ---".postln;\n' +
+						'~dirt.orbits.do { |o|\n' +
+						'  o.group.freeAll;\n' +            // kill every synth in the orbit
+						'  o.initNodeTree;\n' +             // rebuild its effect chain
+						'};\n' +
+						'"--- panic done ---".postln;\n)\n');
+				} catch { /* gone */ }
+				await new Promise((r) => setTimeout(r, 1500));
+				scOut = sclangTail.slice(mark).join("\n").trim() || "(sent)";
+			}
+			lastLabel = "tidal_panic";
+			updateWidget("panic");
+			return {
+				content: [{ type: "text", text: `hush sent; SuperDirt nodes freed and orbit chains rebuilt\n${scOut}` }],
+				details: {},
+			};
+		},
+	});
+
 	pi.registerTool({
 		name: "tidal_eval",
 		label: "Tidal Eval",
