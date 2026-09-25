@@ -39,10 +39,22 @@ export default function (pi: ExtensionAPI) {
 	let lastErrorExcerpt = "";
 	let lastErrorAt = 0;
 	let stderrLines: string[] = [];
-	let sclangTail: string[] = []; // ring buffer of sclang stdout for diagnosis
+	// sclang stdout, kept as the last SCLANG_TAIL_MAX lines plus a monotonic
+	// counter (sclangSeq). NEVER index the ring by sclangTail.length: the buffer
+	// shifts as it fills, so a mark taken at length N goes stale the moment new
+	// lines arrive — every tidal_sc eval then returned "(no sclang output)"
+	// while the buffer sat full of boot banner lines, hiding parse errors,
+	// runtime errors AND replies (this made sclang look mute for a whole day).
+	let sclangTail: string[] = [];
+	let sclangSeq = 0;
 	let lastChunks: string[] = []; // recent non-stream chunks (hush/setcps/do-blocks), re-fired after revival
 	const streamChunks = new Map<string, string>(); // "d4" -> latest chunk for that stream (incl. silences)
-	let bootTailLen = 0; // sclangTail index where the current boot started
+	let bootSeq = 0;     // sclangSeq value where the current boot started
+	const SCLANG_TAIL_MAX = 800;
+	function sclangLinesSince(seq: number): string[] {
+		const n = Math.min(sclangSeq - seq, sclangTail.length);
+		return n <= 0 ? [] : sclangTail.slice(-n);
+	}
 	let replStdoutBuf = "";
 	let watchdog: ReturnType<typeof setInterval> | null = null;
 
@@ -162,11 +174,13 @@ export default function (pi: ExtensionAPI) {
 		sclangProc = cp.spawn(cmd, args, { cwd: process.cwd(), env, stdio: ["pipe", "pipe", "pipe"] });
 		weSpawnedSclang = true;
 		sclangTail = [];
-		bootTailLen = 0; // marker into sclangTail for this boot
+		sclangSeq = 0;
+		bootSeq = 0; // marker for this boot
 		sclangProc.stdout?.on("data", (d: Buffer) => {
 			for (const line of d.toString().split("\n")) {
+				sclangSeq++;
 				sclangTail.push(line);
-				if (sclangTail.length > 40) sclangTail.shift();
+				if (sclangTail.length > SCLANG_TAIL_MAX) sclangTail.shift();
 			}
 		});
 		sclangProc.stderr?.on("data", () => {});
@@ -217,7 +231,7 @@ export default function (pi: ExtensionAPI) {
 	function serverListeningSinceBoot(): boolean {
 		// SuperDirt's port binds early; our layer finishes later and writes "done".
 		// Require BOTH, and refuse to report ready while a boot stage is failing.
-		const portUp = sclangTail.slice(bootTailLen).some((l) => l.includes("listening on port 57120"));
+		const portUp = sclangLinesSince(bootSeq).some((l) => l.includes("listening on port 57120"));
 		if (!portUp) return false;
 		try {
 					const boot = fs.readFileSync(path.join(currentCwd, "sc/boot.log"), "utf8").trim().split("\n");
@@ -233,7 +247,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function serverDiedSinceBoot(): boolean {
-		return sclangTail.slice(bootTailLen).some((l) => l.includes("exited with exit code"));
+		return sclangLinesSince(bootSeq).some((l) => l.includes("exited with exit code"));
 	}
 
 	// Real implementation (may block while a stack boots).
@@ -459,17 +473,28 @@ export default function (pi: ExtensionAPI) {
 
 	function sendChunk(chunk: string): boolean {
 		if (!replProc?.stdin || !replReady) return false;
-		const wrapped = ":{\n" + chunk + "\n:}\n";
-		replProc.stdin.write(wrapped);
-		// track state per stream: a later "d4 $ silence" must override an earlier
-		// "d4 $ ..." chunk, so revival restores what is ACTUALLY playing instead
-		// of resurrecting long-replaced patterns (this bug kept a silenced piano
-		// coming back after every ghci revival)
-		const sm = chunk.match(/^\s*d(\d+)\s*\$/);
-		if (sm) streamChunks.set(`d${sm[1]}`, chunk);
-		else {
-			lastChunks.push(chunk);
-			if (lastChunks.length > 12) lastChunks.shift();
+		// This REPL merges the lines of a :{...:} block into ONE expression, so a
+		// chunk with several statements (e.g. a comment glued to d1..d4) parses
+		// as `# gain 1.0 d2 $ ...` and silently kills every stream in it — the
+		// "buried beat" bug. Send statement-per-statement: strip comments, one
+		// block per statement.
+		const stmts = chunk
+			.split("\n")
+			.map((l) => l.trim())
+			.filter((l) => l.length > 0 && !l.startsWith("--"));
+		if (stmts.length === 0) return true;
+		for (const line of stmts) {
+			replProc.stdin.write(":{\n" + line + "\n:}\n");
+			// track state per stream: a later "d4 $ silence" must override an earlier
+			// "d4 $ ..." chunk, so revival restores what is ACTUALLY playing instead
+			// of resurrecting long-replaced patterns (this bug kept a silenced piano
+			// coming back after every ghci revival)
+			const sm = line.match(/^d(\d+)\s*\$/);
+			if (sm) streamChunks.set(`d${sm[1]}`, line);
+			else {
+				lastChunks.push(line);
+				if (lastChunks.length > 12) lastChunks.shift();
+			}
 		}
 		return true;
 	}
@@ -783,8 +808,11 @@ export default function (pi: ExtensionAPI) {
 			if (!sclangProc || !sclangProc.stdin) {
 				return { content: [{ type: "text", text: "tidal_sc: no sclang stdin available" }], details: {} };
 			}
-			const mark = sclangTail.length;
-			const loadAndEval = `(\n${params.code}\n)\n`;
+			const mark = sclangSeq;
+			// trailing marker: if the block parses and runs, the header line prints.
+			// If NOTHING prints (not even an ERROR: line), the eval was a silent
+			// parse no-op — sclang's biggest trap (e.g. var after statements).
+			const loadAndEval = `(\n"[tidal_sc eval ${Date.now()}]".postln;\n${params.code}\n)\n`;
 			try {
 				sclangProc.stdin.write(loadAndEval);
 			} catch (e) {
@@ -792,11 +820,15 @@ export default function (pi: ExtensionAPI) {
 			}
 			const settle = params.settleMs ?? 900;
 			await new Promise((r) => setTimeout(r, settle));
-			const out = sclangTail.slice(mark).join("\n").trim();
+			const out = sclangLinesSince(mark).join("\n").trim();
 			lastLabel = "tidal_sc";
 			updateWidget("eval sclang");
 			return {
-				content: [{ type: "text", text: out || "(no sclang output — eval sent; sclang errors print asynchronously)" }],
+				content: [{ type: "text", text: out ||
+					"(no sclang output at all — the eval most likely failed to PARSE and silently " +
+					"no-opped: sclang posts syntax errors as 'ERROR: syntax error ...' but throws " +
+					"nothing through executeFile/compile. Most common cause: a var declaration after " +
+					"other statements in a function/block body; also unbalanced brackets/strings.)" }],
 				details: {},
 			};
 		},
@@ -888,7 +920,7 @@ export default function (pi: ExtensionAPI) {
 			if (!sclangProc || !sclangProc.stdin) {
 				return { content: [{ type: "text", text: "tidal_sc_reload: no sclang stdin available" }], details: {} };
 			}
-			const mark = sclangTail.length;
+			const mark = sclangSeq;
 			const sc = `${ctx.cwd}/sc/init.scd`;
 			try {
 				sclangProc.stdin.write(`(\n"--- reloading ${sc}".postln;\nthis.executeFile("${sc}");\n)\n`);
@@ -896,7 +928,7 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: `tidal_sc_reload: write failed: ${e}` }], details: {} };
 			}
 			await new Promise((r) => setTimeout(r, 2500));
-			const out = sclangTail.slice(mark).join("\n").trim();
+			const out = sclangLinesSince(mark).join("\n").trim();
 			lastLabel = "tidal_sc_reload";
 			updateWidget("reload sc layer");
 			return { content: [{ type: "text", text: out || "(sent; sc/boot.log records the stages)" }], details: {} };
@@ -927,7 +959,7 @@ export default function (pi: ExtensionAPI) {
 			} catch { /* no log yet */ }
 			let live = "";
 			if (sclangProc?.stdin) {
-				const mark = sclangTail.length;
+				const mark = sclangSeq;
 				try {
 					sclangProc.stdin.write(
 						'(\n"--- sc state ---".postln;\n' +
@@ -937,7 +969,7 @@ export default function (pi: ExtensionAPI) {
 						'"--- end ---".postln;\n)\n');
 				} catch { /* gone */ }
 				await new Promise((r) => setTimeout(r, 1200));
-				live = sclangTail.slice(mark).join("\n").trim();
+				live = sclangLinesSince(mark).join("\n").trim();
 			}
 			lastLabel = "tidal_sc_status";
 			updateWidget("sc status");
@@ -969,7 +1001,7 @@ export default function (pi: ExtensionAPI) {
 			sendChunk("hush");                       // stop events on the Tidal side
 			let scOut = "(no sclang stdin)";
 			if (sclangProc?.stdin) {
-				const mark = sclangTail.length;
+				const mark = sclangSeq;
 				try {
 					sclangProc.stdin.write(
 						'(\n"--- panic: freeing stuck nodes ---".postln;\n' +
@@ -980,7 +1012,7 @@ export default function (pi: ExtensionAPI) {
 						'"--- panic done ---".postln;\n)\n');
 				} catch { /* gone */ }
 				await new Promise((r) => setTimeout(r, 1500));
-				scOut = sclangTail.slice(mark).join("\n").trim() || "(sent)";
+				scOut = sclangLinesSince(mark).join("\n").trim() || "(sent)";
 			}
 			lastLabel = "tidal_panic";
 			updateWidget("panic");
