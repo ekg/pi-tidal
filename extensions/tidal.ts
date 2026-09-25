@@ -181,6 +181,15 @@ export default function (pi: ExtensionAPI) {
 		sclangTail = [];
 		sclangSeq = 0;
 		bootSeq = 0; // marker for this boot
+		// scsynth does not auto-connect its jack ports under pw-jack: link them
+		// to the default sink once the server is up. Idempotent ("File exists"
+		// means already linked). Without this the graph plays to nobody.
+		cp.exec(
+			"sleep 20; for i in 1 2; do " +
+			"ch=$([ $i = 1 ] && echo FL || echo FR); " +
+			"pw-link \"SuperCollider:out_$i\" \"$(pw-link -i 2>/dev/null | grep \"sink:playback_$ch\" | head -n1)\" 2>/dev/null; done",
+			(err) => { if (err) dbg("jack link: " + err.message); }
+		);
 		sclangProc.stdout?.on("data", (d: Buffer) => {
 			for (const line of d.toString().split("\n")) {
 				sclangSeq++;
