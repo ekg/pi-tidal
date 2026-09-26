@@ -14,9 +14,11 @@ import * as dgram from "node:dgram";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { createSclangTransport } from "../lib/sclang-command.mjs";
+import { ownedProcessIds } from "../lib/process-tree.mjs";
 
 const PW_JACK = "/usr/lib/x86_64-linux-gnu/pipewire-0.3/jack";
-const PACKAGE_DIR = fileURLToPath(new URL(".", import.meta.url)); // .../pi-tidal/extensions/
+const PACKAGE_DIR = fileURLToPath(new URL("..", import.meta.url)); // .../pi-tidal/
 const SCSYNTH_PORT = 57110;
 const SUPERDIRT_PORT = 57120;
 const DEBUG = !!process.env.TIDAL_EXT_DEBUG;
@@ -25,6 +27,10 @@ function dbg(...args: unknown[]) { if (DEBUG) console.error("[tidal-ext]", ...ar
 export default function (pi: ExtensionAPI) {
 	// ---------- state ----------
 	let sclangProc: cp.ChildProcess | null = null;
+	const scTransport = createSclangTransport((command: string) => {
+		if (!sclangProc?.stdin?.writable) throw new Error("no writable sclang stdin");
+		sclangProc.stdin.write(command);
+	});
 	let scBootError = "";                      // last failing boot stage, if any
 	let currentCwd = process.cwd();            // for reading sc/boot.log from the probes
 	let lastStateFile: string | null = null;   // last ":script foo.tidal" we loaded
@@ -60,10 +66,9 @@ export default function (pi: ExtensionAPI) {
 
 	// ---------- recording state ----------
 	let recActive = false;
-	let recVia: "sclang" | "pw" | null = null;
+	let recVia: "sclang" | null = null;
 	let recPath = "";
 	let recStartedAt = 0;
-	let pwRecProc: cp.ChildProcess | null = null;
 
 	// ---------- OSC / scsynth ----------
 	function pad(b: Buffer): Buffer {
@@ -143,14 +148,24 @@ export default function (pi: ExtensionAPI) {
 	// started and leaves the partner process orphaned — the source of the duplicate
 	// sclang / port-held-by-a-dead-stack mess.
 	function killOwnStack() {
-		if (sclangProc?.pid) {
-			const pid = sclangProc.pid;
-			try { cp.execSync(`pkill -P ${pid}`, { stdio: "ignore" }); } catch { /* none */ }
-			try { cp.execSync(`kill -TERM ${pid}`, { stdio: "ignore" }); } catch { /* gone */ }
+		let rows: { pid: number; ppid: number }[] = [];
+		try {
+			rows = cp.execFileSync("ps", ["-eo", "pid=,ppid="], { encoding: "utf8" })
+				.trim().split("\n").map((line) => {
+					const [pid, ppid] = line.trim().split(/\s+/).map(Number);
+					return { pid, ppid };
+				});
+		} catch { /* at least terminate our direct children */ }
+		for (const child of [sclangProc, replProc]) {
+			if (!child?.pid) continue;
+			for (const pid of ownedProcessIds(child.pid, rows)) {
+				try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
+			}
 		}
-		if (replProc?.pid) {
-			try { cp.execSync(`kill -TERM ${replProc.pid}`, { stdio: "ignore" }); } catch { /* gone */ }
-		}
+		sclangProc = null;
+		replProc = null;
+		replReady = false;
+		weSpawnedSclang = false;
 	}
 
 	function killStack() { killOwnStack(); }
@@ -168,9 +183,8 @@ export default function (pi: ExtensionAPI) {
 		// systemd-inhibit blocks suspend while the stack runs — a suspend/resume
 		// cycle kills scsynth's pipewire-jack client (clean exit(0)), which was
 		// the recurring "Server exited with exit code 0" mystery.
-		// pw-jack WRAPPER is required, not just its LD_LIBRARY_PATH: with only
-		// the env var scsynth loaded pipewire's libjack but never appeared in
-		// the pipewire graph (zero ports, silent speakers for a whole session).
+		// Keep the explicit pw-jack launch recipe. The September silence was
+		// a commented-out DSP return, not evidence that PipeWire links failed.
 		const inhibit = fs.existsSync("/usr/bin/systemd-inhibit");
 		const cmd = inhibit ? "systemd-inhibit" : "pw-jack";
 		const args = inhibit
@@ -198,7 +212,8 @@ export default function (pi: ExtensionAPI) {
 			}
 		});
 		sclangProc.stderr?.on("data", () => {});
-		sclangProc.on("exit", () => { sclangProc = null; });
+		const owner = sclangProc;
+		sclangProc.on("exit", () => { if (sclangProc === owner) sclangProc = null; });
 	}
 
 	function startRepl(cwd: string): void {
@@ -239,7 +254,11 @@ export default function (pi: ExtensionAPI) {
 		setTimeout(() => { try { replProc?.stdin?.write("\n"); } catch { /* gone */ } }, 5000);
 		setInterval(() => { if (!replReady) { try { replProc?.stdin?.write("\n"); } catch { /* gone */ } } }, 10_000).unref();
 		replProc.stderr?.on("data", (d: Buffer) => handleStderr(d.toString()));
-		replProc.on("exit", () => { replProc = null; replReady = false; updateWidget("repl exited"); });
+		const owner = replProc;
+		replProc.on("exit", () => {
+			if (replProc !== owner) return;
+			replProc = null; replReady = false; updateWidget("repl exited");
+		});
 	}
 
 	function serverListeningSinceBoot(): boolean {
@@ -250,8 +269,8 @@ export default function (pi: ExtensionAPI) {
 		try {
 					const boot = fs.readFileSync(path.join(currentCwd, "sc/boot.log"), "utf8").trim().split("\n");
 			const tail = boot.slice(-14);
-			if (tail.some((l) => l.includes("FAIL"))) {
-				scBootError = tail.filter((l) => l.includes("FAIL")).slice(-2).join("\n");
+			if (boot.some((l) => l.includes("FAIL"))) {
+				scBootError = boot.filter((l) => l.includes("FAIL")).slice(-2).join("\n");
 				return false;                       // surfacing this is the whole point
 			}
 			return tail.some((l) => l.includes("done"));
@@ -308,7 +327,9 @@ export default function (pi: ExtensionAPI) {
 		watchdog = setInterval(async () => {
 			if (reviving || !weSpawnedSclang) return;
 			if (Date.now() - lastReviveAt < 15_000) return;
+			const owner = sclangProc;
 			const sc = await queryScsynth(3000);
+			if (!watchdog || owner !== sclangProc || !weSpawnedSclang) return;
 			scsynthCached = sc;
 			if (sc.alive) { scsynthMisses = 0; return; }
 			scsynthMisses++;
@@ -352,23 +373,7 @@ export default function (pi: ExtensionAPI) {
 	// ---------- recording ----------
 	// Preferred path: scsynth records its own output bus via s.record — a clean
 	// pre-mixer tap with no system audio (browser, notifications) and no
-	// clipping from the user's output volume. Fallback: pw-record on the
-	// default sink's monitor (post-volume, may clip, may capture system audio).
-	function defaultSinkNode(): string | null {
-		try {
-			const out = cp.execSync("wpctl status", { encoding: "utf-8" });
-			let inSinks = false;
-			for (const l of out.split("\n")) {
-				if (/Sinks:/.test(l)) { inSinks = true; continue; }
-				if (!inSinks) continue;
-				if (/endpoints:|Sources:|Devices:/.test(l)) break;
-				const m = l.match(/\*\s*(\d+)\./);
-				if (m) return m[1];
-			}
-		} catch { /* wpctl missing or no default */ }
-		return null;
-	}
-
+	// clipping from the user's output volume. No system-source fallback.
 	function markerPath(): string {
 		return recPath.replace(/\.wav$/, ".markers.jsonl");
 	}
@@ -412,19 +417,11 @@ export default function (pi: ExtensionAPI) {
 				`s.recHeaderFormat = "wav"; s.prepareForRecord(${JSON.stringify(recPath)}); SystemClock.sched(2, { s.record });\n`);
 			await new Promise((r) => setTimeout(r, 3000));
 				if (fs.existsSync(recPath) && fs.statSync(recPath).size > 44) recVia = "sclang";
-			} catch { /* fall through to pw-record */ }
+			} catch { /* fail closed below */ }
 		}
-		if (!recVia) {
-			const sink = defaultSinkNode();
-			if (sink) {
-				pwRecProc = cp.spawn("pw-record", ["--target", sink, "--rate", "48000", "--channels", "2", "--format", "f32", recPath], { stdio: "ignore" });
-				pwRecProc.on("exit", () => { pwRecProc = null; });
-				await new Promise((r) => setTimeout(r, 1000));
-				if (fs.existsSync(recPath) && fs.statSync(recPath).size > 44) recVia = "pw";
-				else pwRecProc = null;
-			}
-		}
-		if (!recVia) return "could not start recording (sclang s.record and pw-record both failed)";
+		// Fail closed: an unresolved pw-record target can capture the microphone.
+		// Recording this stack must never silently fall back to a system source.
+		if (!recVia) return "could not start scsynth output recording (no system/microphone fallback)";
 		recActive = true;
 		writeMarker("start");
 		updateWidget(`recording: ${path.basename(recPath)}`);
@@ -437,8 +434,6 @@ export default function (pi: ExtensionAPI) {
 		writeMarker("stop");
 		if (recVia === "sclang" && sclangProc?.stdin) {
 			try { sclangProc.stdin.write("s.stopRecording;\n"); } catch { /* gone */ }
-		} else if (recVia === "pw" && pwRecProc) {
-			try { pwRecProc.kill("SIGINT"); } catch { /* gone */ }
 		}
 		await new Promise((r) => setTimeout(r, 1500));
 		const dur = Math.round((Date.now() - recStartedAt) / 100) / 10;
@@ -456,25 +451,11 @@ export default function (pi: ExtensionAPI) {
 
 	function teardown(reason?: string): void {
 		if (watchdog) { clearInterval(watchdog); watchdog = null; }
-		if (replProc) { try { replProc.kill("SIGTERM"); } catch { /* gone */ } }
-		// ghci must die (a fresh instance takes over scheduling), but on session
-		// transitions that keep pi running — /reload, new/resume/fork — leave the
-		// SuperDirt stack (sclang + scsynth) up so samples stay loaded and the
-		// next session boots instantly. Only a real quit tears everything down.
-		if (!reason || reason === "quit") {
-			if (sclangProc) {
-				try { sclangProc.kill("SIGTERM"); } catch { /* gone */ }
-				setTimeout(() => {
-					// the systemd-inhibit wrapper does not forward signals to sclang,
-					// so make sure no orphans survive teardown
-					try { cp.execSync("pkill -u $USER -x sclang", { stdio: "ignore" }); } catch { /* none */ }
-					try { cp.execSync("pkill -u $USER -x scsynth", { stdio: "ignore" }); } catch { /* none */ }
-				}, 1500);
-			}
-		}
-		replProc = null;
-		sclangProc = null;
-		replReady = false;
+		// A replacement extension cannot recover this stdin pipe. Leaving SC
+		// alive across /reload created an unmanageable orphan; stop only our
+		// complete process tree, on reload as well as quit. No delayed pkill.
+		killOwnStack();
+		scTransport.dispose();
 	}
 
 	// ---------- chunk handling ----------
@@ -712,18 +693,21 @@ export default function (pi: ExtensionAPI) {
 	// result (observed when sclang could not initialise audio because an orphaned
 	// scsynth held the device — the plugin kept waiting for a stack that could
 	// never come up). Fail loudly with a diagnosis instead.
+	let ensureFlight: Promise<string> | null = null;
 	async function ensureStack(cwd: string): Promise<string> {
-		const timeout = new Promise<string>((resolve) =>
-			setTimeout(() => resolve(
-				"stack did not become ready within 120s.\n" +
-				"diagnose from a shell:\n" +
-				"  pgrep -a sclang; pgrep -a scsynth\n" +
-				"  tail -20 sc/boot.log\n" +
-				"  ss -lnup | grep -E '57110|57120'\n" +
-				"if sclang is missing or dying, kill leftovers and start it as:\n" +
-				"  pkill -u $USER -x sclang; pkill -u $USER -x scsynth; pw-jack sclang"),
-				120_000));
-		return Promise.race([ensureStackInner(cwd), timeout]);
+		// Concurrent tools must share one boot, including after a caller times
+		// out. Clearing this on timeout would spawn another stack over the first.
+		if (!ensureFlight) {
+			ensureFlight = ensureStackInner(cwd).finally(() => { ensureFlight = null; });
+		}
+		let timer: ReturnType<typeof setTimeout>;
+		const timeout = new Promise<string>((resolve) => {
+			timer = setTimeout(() => resolve(
+				"stack did not become ready within 120s; boot may still be in progress. " +
+				"Inspect sc/boot.log and owned process state; do not launch a second sclang."), 120_000);
+		});
+		try { return await Promise.race([ensureFlight, timeout]); }
+		finally { clearTimeout(timer!); }
 	}
 
 	pi.registerTool({
@@ -823,12 +807,11 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: "tidal_sc: no sclang stdin available" }], details: {} };
 			}
 			const mark = sclangSeq;
-			// trailing marker: if the block parses and runs, the header line prints.
-			// If NOTHING prints (not even an ERROR: line), the eval was a silent
-			// parse no-op — sclang's biggest trap (e.g. var after statements).
-			const loadAndEval = `(\n"[tidal_sc eval ${Date.now()}]".postln;\n${params.code}\n)\n`;
+			// Preserve multiline source in a file; readline stdin otherwise
+			// evaluates '(' and each body line separately. Do not prepend a
+			// marker to the source: that would invalidate leading var declarations.
 			try {
-				sclangProc.stdin.write(loadAndEval);
+				scTransport.send(params.code, `[tidal_sc eval ${Date.now()}]`);
 			} catch (e) {
 				return { content: [{ type: "text", text: `tidal_sc: write failed: ${e}` }], details: {} };
 			}
@@ -937,7 +920,8 @@ export default function (pi: ExtensionAPI) {
 			const mark = sclangSeq;
 			const sc = `${ctx.cwd}/sc/init.scd`;
 			try {
-				sclangProc.stdin.write(`(\n"--- reloading ${sc}".postln;\nthis.executeFile("${sc}");\n)\n`);
+				// init.scd uses s.sync/wait; reload it inside a Routine, as at boot.
+				scTransport.send(`fork { this.executeFile(${JSON.stringify(sc)}); };`, "reload SC layer");
 			} catch (e) {
 				return { content: [{ type: "text", text: `tidal_sc_reload: write failed: ${e}` }], details: {} };
 			}
@@ -975,7 +959,7 @@ export default function (pi: ExtensionAPI) {
 			if (sclangProc?.stdin) {
 				const mark = sclangSeq;
 				try {
-					sclangProc.stdin.write(
+					scTransport.send(
 						'(\n"--- sc state ---".postln;\n' +
 						'~dirt.orbits.do { |o, i| ("  orbit % -> bus %  fx: %".format(i, o.outBus.asString, ' +
 						'o.globalEffects.collect { |e| e.name.asString }.join(" -> "))).postln };\n' +
@@ -1017,13 +1001,9 @@ export default function (pi: ExtensionAPI) {
 			if (sclangProc?.stdin) {
 				const mark = sclangSeq;
 				try {
-					sclangProc.stdin.write(
-						'(\n"--- panic: freeing stuck nodes ---".postln;\n' +
-						'~dirt.orbits.do { |o|\n' +
-						'  o.group.freeAll;\n' +            // kill every synth in the orbit
-						'  o.initNodeTree;\n' +             // rebuild its effect chain
-						'};\n' +
-						'"--- panic done ---".postln;\n)\n');
+					scTransport.send(
+						'~dirt.orbits.do { |o| o.freeSynths };\n' +
+						'"--- panic done ---".postln;');
 				} catch { /* gone */ }
 				await new Promise((r) => setTimeout(r, 1500));
 				scOut = sclangLinesSince(mark).join("\n").trim() || "(sent)";
@@ -1053,6 +1033,8 @@ export default function (pi: ExtensionAPI) {
 			})),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			currentCwd = ctx.cwd;
+			if (watchdog) { clearInterval(watchdog); watchdog = null; }
 			const before = fs.existsSync(path.join(ctx.cwd, "sc/boot.log"))
 				? fs.statSync(path.join(ctx.cwd, "sc/boot.log")).mtimeMs : 0;
 			killOwnStack();
@@ -1066,7 +1048,7 @@ export default function (pi: ExtensionAPI) {
 				try {
 					const p = path.join(ctx.cwd, "sc/boot.log");
 					if (!fs.existsSync(p) || fs.statSync(p).mtimeMs <= before) continue;
-					const tail = fs.readFileSync(p, "utf8").trim().split("\n").slice(-14);
+					const tail = fs.readFileSync(p, "utf8").trim().split("\n");
 					if (tail.some((l) => l.includes("FAIL"))) {
 						scBootError = tail.filter((l) => l.includes("FAIL")).slice(-2).join("\n");
 						return { content: [{ type: "text", text: `restart failed at a boot stage:\n${scBootError}` }], details: {} };
@@ -1077,6 +1059,9 @@ export default function (pi: ExtensionAPI) {
 			if (!ok) {
 				return { content: [{ type: "text", text: "restart: boot never reached 'done' (see sc/boot.log)" }], details: {} };
 			}
+			if (!await waitFor(() => replReady, 90_000, 1000)) {
+				return { content: [{ type: "text", text: "restart: SC booted but Tidal REPL never became ready" }], details: {} };
+			}
 			let resent = "none";
 			const target = params.file ?? lastStateFile;
 			if (target) {
@@ -1084,8 +1069,10 @@ export default function (pi: ExtensionAPI) {
 					const c = chunk.trim();
 					if (c && !c.split("\n").every((l) => l.trim().startsWith("--"))) sendChunk(c);
 				}
+				lastStateFile = target;
 				resent = target;
 			}
+			startWatchdog();
 			lastLabel = "tidal_restart";
 			updateWidget("stack restarted");
 			return { content: [{ type: "text", text: `stack restarted (boot ok, REPL fresh); re-sent ${resent}` }], details: {} };
