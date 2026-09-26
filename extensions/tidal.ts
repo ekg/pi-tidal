@@ -17,6 +17,7 @@ import { Type } from "typebox";
 import { createSclangTransport } from "../lib/sclang-command.mjs";
 import { stopOwnedProcessTree } from "../lib/process-tree.mjs";
 import { createLifecycleQueue } from "../lib/lifecycle.mjs";
+import { formatScStatus } from "../lib/sc-status.mjs";
 
 const PW_JACK = "/usr/lib/x86_64-linux-gnu/pipewire-0.3/jack";
 const PACKAGE_DIR = fileURLToPath(new URL("..", import.meta.url)); // .../pi-tidal/
@@ -170,6 +171,8 @@ export default function (pi: ExtensionAPI) {
 
 	async function startSclang(): Promise<void> {
 		await killOwnStack();
+		scsynthCached = null;
+		updateWidget("booting SC");
 		if (closing) throw new Error("plugin is shutting down");
 		if (udpPortListening(SCSYNTH_PORT) || udpPortListening(SUPERDIRT_PORT)) {
 			throw new Error("audio ports still occupied by an unowned stack; refusing a duplicate boot");
@@ -331,6 +334,8 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (!replProc) startRepl(cwd);
 		const replOk = await waitFor(() => replReady, 90_000, 1000);
+		scsynthCached = await queryScsynth();
+		updateWidget();
 		startWatchdog();
 		return replOk ? "stack ready" : "repl did not become ready within 90s";
 	}
@@ -350,6 +355,7 @@ export default function (pi: ExtensionAPI) {
 			const sc = await queryScsynth(3000);
 			if (!watchdog || owner !== sclangProc || !weSpawnedSclang) return;
 			scsynthCached = sc;
+			updateWidget();
 			if (sc.alive) { scsynthMisses = 0; return; }
 			scsynthMisses++;
 			if (scsynthMisses < 2) return;
@@ -634,7 +640,7 @@ export default function (pi: ExtensionAPI) {
 		if (!piHasUI) return;
 		const sc = scsynthCached;
 		const lines = [
-			`tidal: scsynth ${sc.alive ? `✓ (${sc.synths} synths)` : "✗"} | repl ${replReady ? "✓" : replProc ? "…" : "✗"} | last: ${lastLabel}`,
+			`tidal: scsynth ${formatScStatus(sc)} | repl ${replReady ? "✓" : replProc ? "…" : "✗"} | last: ${lastLabel}`,
 		];
 		if (extra) lines.push(extra);
 		try { piSetWidget(lines); } catch { /* UI unavailable */ }
@@ -642,7 +648,7 @@ export default function (pi: ExtensionAPI) {
 
 	// These are captured lazily because ctx isn't available at factory time.
 	let piHasUI = false;
-	let scsynthCached = { alive: false, synths: 0, ugens: 0 };
+	let scsynthCached: { alive: boolean; synths: number; ugens: number } | null = null;
 	function piSetWidget(lines: string[]): void {
 		// setWidget needs a context; use the last registered command ctx trick:
 		// instead we stash a UI-facing callback set during session_start.
@@ -1099,6 +1105,7 @@ export default function (pi: ExtensionAPI) {
 				lastStateFile = target;
 				resent = target;
 			}
+			scsynthCached = await queryScsynth();
 			startWatchdog();
 			lastLabel = "tidal_restart";
 			updateWidget("stack restarted");

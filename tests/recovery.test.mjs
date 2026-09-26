@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import { createSclangTransport } from '../lib/sclang-command.mjs';
 import { ownedProcessIds, stopOwnedProcessTree } from '../lib/process-tree.mjs';
 import { createLifecycleQueue } from '../lib/lifecycle.mjs';
+import { formatScStatus } from '../lib/sc-status.mjs';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -82,6 +83,12 @@ test('boot/restart/shutdown run sequentially and failure does not poison the que
   const shutdown = run(async () => { events.push('shutdown'); });
   await Promise.all([boot, rejected, shutdown]);
   assert.deepEqual(events, ['boot', 'boot done', 'restart', 'shutdown']);
+});
+
+test('widget distinguishes unchecked/no-reply from a live server', () => {
+  assert.equal(formatScStatus(null), '? (not checked)');
+  assert.equal(formatScStatus({ alive: false, synths: 0 }), '? (no reply)');
+  assert.equal(formatScStatus({ alive: true, synths: 132 }), '✓ (132 synths)');
 });
 
 test('extension imports and registers the livecoding tools without booting audio', () => {
