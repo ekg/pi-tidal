@@ -77,7 +77,7 @@ Everything below was hit in production on a Framework laptop, Ubuntu 24.04, Pipe
 - **`Server 'localhost' exited with exit code 0`** — a *clean* scsynth exit with no `/quit` received. On this setup the common cause is a **suspend/resume cycle**: PipeWire drops the JACK client on resume and scsynth exits(0). Mitigations: `systemd-inhibit` around sclang (built in), and the watchdog revives the stack + re-fires recent chunks.
 - **scsynth silent to UDP for 30–90s after spawn** — while sclang churns through class compile + ~450MB of sample reads, scsynth's stdout pipe backs up into the busy interpreter and its network replies stall. Don't health-check the server with OSC during that window; watch sclang's own post output (`SuperDirt: listening on port 57120`) instead — that's what the extension does.
 - **`Could not open UDP port 57120`** — another sclang may hold the port. Inspect its owner before stopping it; never kill all audio processes by name. The extension terminates only its owned process tree (including scsynth grandchildren).
-- **Pi `/reload`** — stops the owned audio stack because a new extension cannot inherit the old stdin handle. The next tool boots a fresh controlled stack. When upgrading from older versions, check for an orphan left by the old shutdown handler.
+- **Pi `/reload`** — stops the owned audio stack because a new extension cannot inherit the old stdin handle. Shutdown waits for the full owned tree to exit (TERM, then bounded KILL if necessary), verifies PID identities, and cancels delayed link/REPL timers. Boot, restart and shutdown are serialized. The next tool boots a fresh controlled stack; occupied unowned ports cause a refusal, not a duplicate boot. When upgrading from older versions, check for an orphan left by the old shutdown handler.
 - **Multiline sclang evaluation** — readline evaluates physical stdin lines independently. The plugin saves the exact source in a temporary `.scd` file and sends one `executeFile` command; leading `var` declarations and comments are preserved.
 - **Ambiguous module `Sound.Tidal.Context`** — two copies of the same tidal version registered in the cabal store (e.g. after a reinstall without cleanup). Remove the stale `.conf` from `~/.cabal/store/ghc-*/package.db/` and fix `~/.ghc/*/environments/default`.
 - **`s.reboot` in a startup file** — on a fresh sclang the server is never booted, and `s.reboot` can produce a boot race that cleanly kills the freshly booted server. Use `s.waitForBoot`.
@@ -88,7 +88,7 @@ Everything below was hit in production on a Framework laptop, Ubuntu 24.04, Pipe
 ```
 extensions/tidal.ts   the pi extension
 lib/                 sclang transport and owned-process helpers
- tests/recovery.test.mjs  regression tests (node --test tests/recovery.test.mjs)
+tests/recovery.test.mjs  regression tests (node --test tests/recovery.test.mjs)
 prompts/jam.md        /jam session starter
 BootTidal.hs          Tidal REPL boot script (bundled fallback)
 sc/superdirt_startup.scd  battle-tested SuperDirt boot (waitForBoot, no s.reboot)

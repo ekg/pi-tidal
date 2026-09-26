@@ -15,7 +15,8 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createSclangTransport } from "../lib/sclang-command.mjs";
-import { ownedProcessIds } from "../lib/process-tree.mjs";
+import { stopOwnedProcessTree } from "../lib/process-tree.mjs";
+import { createLifecycleQueue } from "../lib/lifecycle.mjs";
 
 const PW_JACK = "/usr/lib/x86_64-linux-gnu/pipewire-0.3/jack";
 const PACKAGE_DIR = fileURLToPath(new URL("..", import.meta.url)); // .../pi-tidal/
@@ -26,6 +27,8 @@ function dbg(...args: unknown[]) { if (DEBUG) console.error("[tidal-ext]", ...ar
 
 export default function (pi: ExtensionAPI) {
 	// ---------- state ----------
+	const lifecycle = createLifecycleQueue();
+	let closing = false;
 	let sclangProc: cp.ChildProcess | null = null;
 	const scTransport = createSclangTransport((command: string) => {
 		if (!sclangProc?.stdin?.writable) throw new Error("no writable sclang stdin");
@@ -126,6 +129,7 @@ export default function (pi: ExtensionAPI) {
 	async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs: number, everyMs = 2000): Promise<boolean> {
 		const deadline = Date.now() + timeoutMs;
 		while (Date.now() < deadline) {
+			if (closing) throw new Error("plugin is shutting down");
 			if (await predicate()) { dbg("waitFor ok"); return true; }
 			let scProc = "none";
 			try {
@@ -147,31 +151,29 @@ export default function (pi: ExtensionAPI) {
 	// A blind `pkill -u $USER -x sclang` (the old behaviour) kills a stack the user
 	// started and leaves the partner process orphaned — the source of the duplicate
 	// sclang / port-held-by-a-dead-stack mess.
-	function killOwnStack() {
-		let rows: { pid: number; ppid: number }[] = [];
-		try {
-			rows = cp.execFileSync("ps", ["-eo", "pid=,ppid="], { encoding: "utf8" })
-				.trim().split("\n").map((line) => {
-					const [pid, ppid] = line.trim().split(/\s+/).map(Number);
-					return { pid, ppid };
-				});
-		} catch { /* at least terminate our direct children */ }
-		for (const child of [sclangProc, replProc]) {
-			if (!child?.pid) continue;
-			for (const pid of ownedProcessIds(child.pid, rows)) {
-				try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
-			}
+	let linkTimer: ReturnType<typeof setTimeout> | null = null;
+	let replPokeTimer: ReturnType<typeof setInterval> | null = null;
+	let replInitialPokeTimer: ReturnType<typeof setTimeout> | null = null;
+	async function killOwnStack(): Promise<void> {
+		if (linkTimer) { clearTimeout(linkTimer); linkTimer = null; }
+		if (replPokeTimer) { clearInterval(replPokeTimer); replPokeTimer = null; }
+		if (replInitialPokeTimer) { clearTimeout(replInitialPokeTimer); replInitialPokeTimer = null; }
+		weSpawnedSclang = false;
+		for (const child of [replProc, sclangProc]) {
+			if (!child?.pid || child.exitCode !== null || child.signalCode !== null) continue;
+			await stopOwnedProcessTree(child.pid);
 		}
 		sclangProc = null;
 		replProc = null;
 		replReady = false;
-		weSpawnedSclang = false;
 	}
 
-	function killStack() { killOwnStack(); }
-
-	function startSclang(): void {
-		killStack();
+	async function startSclang(): Promise<void> {
+		await killOwnStack();
+		if (closing) throw new Error("plugin is shutting down");
+		if (udpPortListening(SCSYNTH_PORT) || udpPortListening(SUPERDIRT_PORT)) {
+			throw new Error("audio ports still occupied by an unowned stack; refusing a duplicate boot");
+		}
 		// On pipewire systems, scsynth links jackd2's libjack by default and
 		// auto-spawns a jackd that fights pipewire for the ALSA device (SIGABRT).
 		// Point it at pipewire's own libjack when that exists; otherwise assume
@@ -198,13 +200,23 @@ export default function (pi: ExtensionAPI) {
 		// scsynth does not auto-connect its jack ports under pw-jack: link them
 		// to the default sink once the server is up. Idempotent ("File exists"
 		// means already linked). Without this the graph plays to nobody.
-		cp.exec(
-			"sleep 20; for i in 1 2; do " +
-			"ch=$([ $i = 1 ] && echo FL || echo FR); " +
-			"pw-link \"SuperCollider:out_$i\" \"$(pw-link -i 2>/dev/null | grep \"sink:playback_$ch\" | head -n1)\" 2>/dev/null; done",
-			(err) => { if (err) dbg("jack link: " + err.message); }
-		);
+		const linkOwner = sclangProc;
+		linkTimer = setTimeout(() => {
+			linkTimer = null;
+			if (sclangProc !== linkOwner) return;
+			try {
+				const ports = cp.execFileSync("pw-link", ["-i"], { encoding: "utf8" }).split("\n");
+				for (const [i, channel] of [[1, "FL"], [2, "FR"]] as const) {
+					const target = ports.find((p) => p.includes(`sink:playback_${channel}`))?.trim();
+					if (target) {
+						try { cp.execFileSync("pw-link", [`SuperCollider:out_${i}`, target], { stdio: "ignore" }); }
+						catch { /* already linked */ }
+					}
+				}
+			} catch (error) { dbg("jack link:", error); }
+		}, 20_000);
 		sclangProc.stdout?.on("data", (d: Buffer) => {
+			if (sclangProc !== owner) return;
 			for (const line of d.toString().split("\n")) {
 				sclangSeq++;
 				sclangTail.push(line);
@@ -251,8 +263,11 @@ export default function (pi: ExtensionAPI) {
 			}
 		});
 		// poke stdin so ghci flushes its prompt through the block-buffered pipe
-		setTimeout(() => { try { replProc?.stdin?.write("\n"); } catch { /* gone */ } }, 5000);
-		setInterval(() => { if (!replReady) { try { replProc?.stdin?.write("\n"); } catch { /* gone */ } } }, 10_000).unref();
+		if (replInitialPokeTimer) clearTimeout(replInitialPokeTimer);
+		replInitialPokeTimer = setTimeout(() => { try { replProc?.stdin?.write("\n"); } catch { /* gone */ } }, 5000);
+		if (replPokeTimer) clearInterval(replPokeTimer);
+		replPokeTimer = setInterval(() => { if (!replReady) { try { replProc?.stdin?.write("\n"); } catch { /* gone */ } } }, 10_000);
+		replPokeTimer.unref();
 		replProc.stderr?.on("data", (d: Buffer) => handleStderr(d.toString()));
 		const owner = replProc;
 		replProc.on("exit", () => {
@@ -285,8 +300,12 @@ export default function (pi: ExtensionAPI) {
 
 	// Real implementation (may block while a stack boots).
 	async function ensureStackInner(cwd: string): Promise<string> {
+		if (closing) throw new Error("plugin is shutting down");
 		currentCwd = cwd;
 		const st = await queryScsynth();
+		if (!sclangProc && (st.alive || udpPortListening(SUPERDIRT_PORT))) {
+			return "SC is running outside this plugin instance; no owned stdin. Inspect ownership before restarting.";
+		}
 		// scsynth is UDP-silent for 30-90s after spawn (README: pipe backpressure
 		// while sclang churns). If the port is bound the server is NOT dead —
 		// treat it as up instead of killStack()ing a healthy stack and rebooting.
@@ -297,7 +316,7 @@ export default function (pi: ExtensionAPI) {
 			// answering UDP for 30-90s. sclang's own post output ("SuperDirt:
 			// listening on port 57120") is the reliable boot signal.
 			for (let attempt = 1; attempt <= 2; attempt++) {
-				startSclang();
+				await startSclang();
 				const ok = await waitFor(() => serverListeningSinceBoot() || serverDiedSinceBoot(), 150_000, 2000);
 				dbg("boot wait result:", ok, "died:", serverDiedSinceBoot());
 				if (ok && !serverDiedSinceBoot()) break;
@@ -325,7 +344,7 @@ export default function (pi: ExtensionAPI) {
 	function startWatchdog(): void {
 		if (watchdog) return;
 		watchdog = setInterval(async () => {
-			if (reviving || !weSpawnedSclang) return;
+			if (closing || reviving || !weSpawnedSclang) return;
 			if (Date.now() - lastReviveAt < 15_000) return;
 			const owner = sclangProc;
 			const sc = await queryScsynth(3000);
@@ -345,7 +364,7 @@ export default function (pi: ExtensionAPI) {
 			updateWidget("scsynth died — reviving");
 			try {
 				const cwd = process.cwd();
-				teardown();
+				await lifecycle(() => teardown());
 				const msg = await ensureStack(cwd);
 				lastReviveAt = Date.now();
 				if (msg.includes("ready")) {
@@ -364,6 +383,8 @@ export default function (pi: ExtensionAPI) {
 				} else {
 					updateWidget(`revive failed: ${msg.slice(0, 40)}`);
 				}
+			} catch (error) {
+				dbg("watchdog recovery failed:", error);
 			} finally {
 				reviving = false;
 			}
@@ -449,12 +470,15 @@ export default function (pi: ExtensionAPI) {
 		return `stopped after ${dur}s, ${size}MB: ${recPath}${extra} | markers: ${markerPath()}`;
 	}
 
-	function teardown(reason?: string): void {
+	async function teardown(reason?: string): Promise<void> {
+		for (const timer of pendingTimers.values()) clearTimeout(timer);
+		pendingTimers.clear();
+		if (errorFlushTimer) { clearTimeout(errorFlushTimer); errorFlushTimer = null; }
 		if (watchdog) { clearInterval(watchdog); watchdog = null; }
 		// A replacement extension cannot recover this stdin pipe. Leaving SC
 		// alive across /reload created an unmanageable orphan; stop only our
 		// complete process tree, on reload as well as quit. No delayed pkill.
-		killOwnStack();
+		await killOwnStack();
 		scTransport.dispose();
 	}
 
@@ -487,6 +511,7 @@ export default function (pi: ExtensionAPI) {
 			const sm = line.match(/^d(\d+)\s*\$/);
 			if (sm) streamChunks.set(`d${sm[1]}`, line);
 			else {
+				if (line === "hush") streamChunks.clear();
 				lastChunks.push(line);
 				if (lastChunks.length > 12) lastChunks.shift();
 			}
@@ -627,6 +652,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ---------- lifecycle ----------
 	pi.on("session_start", async (_event, ctx) => {
+		closing = false;
 		piHasUI = ctx.hasUI;
 		widgetSink = (lines) => {
 			try { ctx.ui.setWidget("tidal", lines); } catch { /* ignore */ }
@@ -643,9 +669,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event) => {
+		closing = true;
+		if (watchdog) { clearInterval(watchdog); watchdog = null; }
 		if (recActive) await stopRecording(false);
 		const reason = (event as { reason?: string } | undefined)?.reason;
-		teardown(reason);
+		await lifecycle(() => teardown(reason));
 	});
 
 	// ---------- auto-eval on edit ----------
@@ -698,7 +726,7 @@ export default function (pi: ExtensionAPI) {
 		// Concurrent tools must share one boot, including after a caller times
 		// out. Clearing this on timeout would spawn another stack over the first.
 		if (!ensureFlight) {
-			ensureFlight = ensureStackInner(cwd).finally(() => { ensureFlight = null; });
+			ensureFlight = lifecycle(() => ensureStackInner(cwd)).finally(() => { ensureFlight = null; });
 		}
 		let timer: ReturnType<typeof setTimeout>;
 		const timeout = new Promise<string>((resolve) => {
@@ -874,27 +902,25 @@ export default function (pi: ExtensionAPI) {
 			"sending nothing), and after editing BootTidal.hs. Patterns do not survive.",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			// the binary is ghc-9.4.7, NOT ghci — matching 'ghci' silently does nothing,
-			// which cost hours. Match the boot file on the command line instead.
-			let killed = 0;
-			try {
-				const pids = cp.execSync(
-					"ps -eo pid,args | awk '/ghci-scri/ && !/awk/ {print $1}'",
-					{ encoding: "utf8" }).trim().split(/\s+/).filter(Boolean);
-				for (const pid of pids) {
-					try { cp.execSync(`kill ${pid}`); killed++; } catch { /* gone */ }
+			return lifecycle(async () => {
+				if (closing) throw new Error("plugin is shutting down");
+				const old = replProc;
+				if (old?.pid && old.exitCode === null && old.signalCode === null) {
+					await stopOwnedProcessTree(old.pid);
 				}
-			} catch { /* none found */ }
-			replProc = null;
-			replReady = false;
-			// respawn immediately so the next eval does not wait on a cold start
-			startRepl(ctx.cwd);
-			lastLabel = "tidal_repl";
-			updateWidget("repl restarting");
-			return {
-				content: [{ type: "text", text: `killed ${killed} REPL process(es); new REPL loading BootTidal.hs (patterns must be re-sent)` }],
-				details: {},
-			};
+				replProc = null;
+				replReady = false;
+				startRepl(ctx.cwd);
+				const ready = await waitFor(() => replReady, 90_000, 1000);
+				lastLabel = "tidal_repl";
+				updateWidget(ready ? "repl ready" : "repl failed");
+				return {
+					content: [{ type: "text", text: ready
+						? "owned REPL restarted and ready (patterns must be re-sent)"
+						: "REPL restart timed out" }],
+					details: {},
+				};
+			});
 		},
 	});
 
@@ -1033,17 +1059,18 @@ export default function (pi: ExtensionAPI) {
 			})),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return lifecycle(async () => {
+			if (closing) throw new Error("plugin is shutting down");
 			currentCwd = ctx.cwd;
 			if (watchdog) { clearInterval(watchdog); watchdog = null; }
 			const before = fs.existsSync(path.join(ctx.cwd, "sc/boot.log"))
 				? fs.statSync(path.join(ctx.cwd, "sc/boot.log")).mtimeMs : 0;
-			killOwnStack();
-			await new Promise((r) => setTimeout(r, 2500));
-			startSclang();
+			await startSclang();
 			startRepl(ctx.cwd);
 			// wait for a FRESH boot log ending in "done"
 			let ok = false;
 			for (let i = 0; i < 40; i++) {
+				if (closing) throw new Error("plugin is shutting down");
 				await new Promise((r) => setTimeout(r, 3000));
 				try {
 					const p = path.join(ctx.cwd, "sc/boot.log");
@@ -1076,6 +1103,7 @@ export default function (pi: ExtensionAPI) {
 			lastLabel = "tidal_restart";
 			updateWidget("stack restarted");
 			return { content: [{ type: "text", text: `stack restarted (boot ok, REPL fresh); re-sent ${resent}` }], details: {} };
+			});
 		},
 	});
 
@@ -1192,8 +1220,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (arg === "restart") {
-				teardown();
-				killStack();
+				await lifecycle(() => teardown());
 				const msg = await ensureStack(ctx.cwd);
 				ctx.ui.notify(`tidal: ${msg}`, msg.includes("ready") ? "info" : "error");
 				return;
