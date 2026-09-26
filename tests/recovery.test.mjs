@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createSclangTransport } from '../lib/sclang-command.mjs';
 import { ownedProcessIds, stopOwnedProcessTree } from '../lib/process-tree.mjs';
 import { createLifecycleQueue } from '../lib/lifecycle.mjs';
@@ -8,8 +10,8 @@ import { formatScStatus } from '../lib/sc-status.mjs';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
-import { fileURLToPath } from 'node:url';
-import extension from '../extensions/tidal.ts';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import extension, { importFreshModule } from '../extensions/tidal.ts';
 
 test('multiline SC source is preserved; stdin receives one physical line', () => {
   const commands = [];
@@ -91,9 +93,27 @@ test('widget distinguishes unchecked/no-reply from a live server', () => {
   assert.equal(formatScStatus({ alive: true, synths: 132 }), '✓ (132 synths)');
 });
 
-test('extension imports and registers the livecoding tools without booting audio', () => {
+test('reload sees newly added helper exports even when the old module is cached', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tidal-reload-test-'));
+  const file = path.join(dir, 'helper.mjs');
+  try {
+    fs.writeFileSync(file, 'export const revision = 1;');
+    const stale = await import(pathToFileURL(file).href);
+    const first = await importFreshModule(file);
+    assert.equal(stale.revision, 1);
+    assert.equal(first.revision, 1);
+    fs.writeFileSync(file, 'export const revision = 2; export function stopOwnedProcessTree() { return "stopped"; }');
+    assert.equal((await import(pathToFileURL(file).href)).stopOwnedProcessTree, undefined);
+    const fresh = await importFreshModule(file);
+    assert.equal(fresh.revision, 2);
+    assert.equal(fresh.stopOwnedProcessTree(), 'stopped');
+    assert.equal(await importFreshModule(file), fresh); // unchanged code reuses one module
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('extension imports and registers the livecoding tools without booting audio', async () => {
   const tools = new Map();
-  extension({
+  await extension({
     registerTool: tool => tools.set(tool.name, tool),
     registerCommand() {}, on() {},
   });

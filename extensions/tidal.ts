@@ -12,12 +12,9 @@ import * as path from "node:path";
 import * as cp from "node:child_process";
 import * as dgram from "node:dgram";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { createSclangTransport } from "../lib/sclang-command.mjs";
-import { stopOwnedProcessTree } from "../lib/process-tree.mjs";
-import { createLifecycleQueue } from "../lib/lifecycle.mjs";
-import { formatScStatus } from "../lib/sc-status.mjs";
 
 const PW_JACK = "/usr/lib/x86_64-linux-gnu/pipewire-0.3/jack";
 const PACKAGE_DIR = fileURLToPath(new URL("..", import.meta.url)); // .../pi-tidal/
@@ -26,7 +23,18 @@ const SUPERDIRT_PORT = 57120;
 const DEBUG = !!process.env.TIDAL_EXT_DEBUG;
 function dbg(...args: unknown[]) { if (DEBUG) console.error("[tidal-ext]", ...args); }
 
-export default function (pi: ExtensionAPI) {
+// Pi/Jiti reloads this entry point but can retain native helper exports. Load
+// the tiny bootstrap through Node itself; it uses content-addressed native ESM
+// imports. Jiti import() strips query strings; Function(import) lacks a VM callback.
+export const importFreshModule = createRequire(import.meta.url)(
+	path.join(PACKAGE_DIR, "lib/fresh-import.cjs")
+).importFreshModule as (filename: string) => Promise<any>;
+
+export default async function (pi: ExtensionAPI) {
+	const { createSclangTransport } = await importFreshModule(path.join(PACKAGE_DIR, "lib/sclang-command.mjs"));
+	const { stopOwnedProcessTree } = await importFreshModule(path.join(PACKAGE_DIR, "lib/process-tree.mjs"));
+	const { createLifecycleQueue } = await importFreshModule(path.join(PACKAGE_DIR, "lib/lifecycle.mjs"));
+	const { formatScStatus } = await importFreshModule(path.join(PACKAGE_DIR, "lib/sc-status.mjs"));
 	// ---------- state ----------
 	const lifecycle = createLifecycleQueue();
 	let closing = false;
