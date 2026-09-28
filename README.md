@@ -59,6 +59,29 @@ It loads sample banks from `~/sounds/*` if present; edit the paths to your own l
 
 Nothing is required in your music repo. If `BootTidal.hs` exists in the project it is used; otherwise the copy bundled with the package is used. `.tidal` files just need to follow the chunk convention: **patterns separated by blank lines, no empty lines inside a `do` block**.
 
+## PipeWire output that follows Ubuntu's sound settings
+
+SuperCollider is a JACK client, so linking it directly to a laptop or USB
+playback port **pins it there** even if the desktop default output changes.
+On Linux with PipeWire + WirePlumber, install the optional virtual bridge:
+
+```bash
+chmod +x ~/pi-tidal/tools/tidal-main-loopback.sh
+mkdir -p ~/.config/systemd/user
+ln -s ~/pi-tidal/systemd/tidal-main-loopback.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now tidal-main-loopback.service
+```
+
+`Tidal Main (virtual)` appears as a sink, but keep a **physical** sink (XREAL or
+laptop speakers) selected as Ubuntu's default. The bridge's playback stream
+has no fixed target, so WirePlumber follows that selection. The extension
+links SuperCollider's stereo outputs to `tidal_main:playback_FL/FR` at boot.
+If the bridge isn't installed, it prefers XREAL when present, then the
+configured default stereo sink. Existing JACK links may need one-time manual
+reconnection when the bridge is first installed; future extension boots choose
+it automatically. No microphone input is involved. Check with `pw-link -l`.
+
 ## Usage
 
 ```bash

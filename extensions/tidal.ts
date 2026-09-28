@@ -35,6 +35,7 @@ export default async function (pi: ExtensionAPI) {
 	const { stopOwnedProcessTree } = await importFreshModule(path.join(PACKAGE_DIR, "lib/process-tree.mjs"));
 	const { createLifecycleQueue } = await importFreshModule(path.join(PACKAGE_DIR, "lib/lifecycle.mjs"));
 	const { formatScStatus } = await importFreshModule(path.join(PACKAGE_DIR, "lib/sc-status.mjs"));
+	const { selectStereoSinkPorts } = await importFreshModule(path.join(PACKAGE_DIR, "lib/output-routing.mjs"));
 	// ---------- state ----------
 	const lifecycle = createLifecycleQueue();
 	let closing = false;
@@ -208,19 +209,23 @@ export default async function (pi: ExtensionAPI) {
 		sclangTail = [];
 		sclangSeq = 0;
 		bootSeq = 0; // marker for this boot
-		// scsynth does not auto-connect its jack ports under pw-jack: link them
-		// to the default sink once the server is up. Idempotent ("File exists"
-		// means already linked). Without this the graph plays to nobody.
+		// scsynth does not auto-connect its jack ports under pw-jack. Prefer
+		// the Tidal Main virtual sink, whose PipeWire playback stream follows
+		// Ubuntu's selected output. Fall back to XREAL/default if unavailable.
+		// Connect one stereo pair, never the first arbitrary physical sink.
 		const linkOwner = sclangProc;
 		linkTimer = setTimeout(() => {
 			linkTimer = null;
 			if (sclangProc !== linkOwner) return;
 			try {
-				const ports = cp.execFileSync("pw-link", ["-i"], { encoding: "utf8" }).split("\n");
-				for (const [i, channel] of [[1, "FL"], [2, "FR"]] as const) {
-					const target = ports.find((p) => p.includes(`sink:playback_${channel}`))?.trim();
-					if (target) {
-						try { cp.execFileSync("pw-link", [`SuperCollider:out_${i}`, target], { stdio: "ignore" }); }
+				const ports = cp.execFileSync("pw-link", ["-i"], { encoding: "utf8" });
+				let defaultSink = "";
+				try { defaultSink = cp.execFileSync("wpctl", ["inspect", "@DEFAULT_AUDIO_SINK@"], { encoding: "utf8" }); }
+				catch { /* no wpctl/default; fall back to the first complete pair */ }
+				const targets = selectStereoSinkPorts(ports, defaultSink);
+				if (targets) {
+					for (const [i, channel] of [[1, "FL"], [2, "FR"]] as const) {
+						try { cp.execFileSync("pw-link", [`SuperCollider:out_${i}`, targets[channel]], { stdio: "ignore" }); }
 						catch { /* already linked */ }
 					}
 				}

@@ -1,0 +1,13 @@
+[Unit]
+Description=Virtual Tidal Main sink following the desktop's default output
+After=pipewire.service wireplumber.service
+Requires=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/pi-tidal/tools/tidal-main-loopback.sh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
