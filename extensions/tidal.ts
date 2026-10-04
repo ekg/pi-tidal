@@ -35,6 +35,7 @@ export default async function (pi: ExtensionAPI) {
 	const { stopOwnedProcessTree } = await importFreshModule(path.join(PACKAGE_DIR, "lib/process-tree.mjs"));
 	const { createLifecycleQueue } = await importFreshModule(path.join(PACKAGE_DIR, "lib/lifecycle.mjs"));
 	const { formatScStatus } = await importFreshModule(path.join(PACKAGE_DIR, "lib/sc-status.mjs"));
+	const { cleanReplError } = await importFreshModule(path.join(PACKAGE_DIR, "lib/repl-error.mjs"));
 	const { selectStereoSinkPorts } = await importFreshModule(path.join(PACKAGE_DIR, "lib/output-routing.mjs"));
 	// ---------- state ----------
 	const lifecycle = createLifecycleQueue();
@@ -648,13 +649,16 @@ export default async function (pi: ExtensionAPI) {
 		// the session with an eval-error-response loop.
 		if (now - lastErrorAt < 30_000) return;
 		// normalize line numbers out before dedupe so the same error re-fired
-		// on chunk edits still counts as "the same error"
-		const excerpt = burst
-			.map((l) => l.replace(/<interactive>:\d+(:\d+)?(-\d+)?:?/g, "<interactive>").trimEnd())
-			.filter((l) => !l.trim().startsWith("--") && !/Suggested fix/.test(l))
-			.filter((l, i, a) => l !== "" || (i > 0 && a[i - 1] !== ""))
-			.join("\n")
-			.trim();
+		// on chunk edits still counts as "the same error", then clean the burst:
+		// rejoin GHC's terminal-width hard wraps (words split mid-token), strip
+		// ANSI/control garbage, collapse blank runs, and cut the CALL STACK dump
+		// so the report is legible and does not flood the scrollback
+		const excerpt = cleanReplError(
+			burst
+				.map((l) => l.replace(/<interactive>:\d+(:\d+)?(-\d+)?:?/g, "<interactive>").trimEnd())
+				.filter((l) => !l.trim().startsWith("--") && !/Suggested fix/.test(l))
+				.join("\n"),
+		);
 		if (!excerpt) return;
 		if (excerpt === lastErrorExcerpt) return; // same error, already reported
 		lastErrorExcerpt = excerpt;
