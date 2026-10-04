@@ -183,7 +183,17 @@ export default async function (pi: ExtensionAPI) {
 		scsynthCached = null;
 		updateWidget("booting SC");
 		if (closing) throw new Error("plugin is shutting down");
-		if (udpPortListening(SCSYNTH_PORT) || udpPortListening(SUPERDIRT_PORT)) {
+		// killOwnStack() has just signalled whatever tree we owned. Its UDP sockets
+		// stay listed in /proc/net/udp until the processes actually exit, so an
+		// immediate check here sees our OWN dying stack and refuses to reboot —
+		// the "ports still occupied" dead end after every /tidal restart. Give the
+		// ports a bounded moment to free before treating them as foreign.
+		const portsFree = await waitFor(
+			() => !udpPortListening(SCSYNTH_PORT) && !udpPortListening(SUPERDIRT_PORT),
+			12_000,
+			250,
+		);
+		if (!portsFree) {
 			throw new Error("audio ports still occupied by an unowned stack; refusing a duplicate boot");
 		}
 		// On pipewire systems, scsynth links jackd2's libjack by default and
@@ -320,7 +330,25 @@ export default async function (pi: ExtensionAPI) {
 		currentCwd = cwd;
 		const st = await queryScsynth();
 		if (!sclangProc && (st.alive || udpPortListening(SUPERDIRT_PORT))) {
-			return "SC is running outside this plugin instance; no owned stdin. Inspect ownership before restarting.";
+			// Something outside this session holds the SC ports. That may be a
+			// healthy foreign stack (another pi session, manual start-tidal.sh) —
+			// or a stack that is mid-death / mid-boot and about to vanish (its
+			// UDP socket lingers in /proc/net/udp until the process exits). Before
+			// refusing, give it a moment and re-check: if the occupant is gone we
+			// can boot normally instead of wedging the session behind a dead end.
+			const wasAlive = st.alive;
+			await new Promise((r) => setTimeout(r, 4000));
+			const re = await queryScsynth();
+			if (!re.alive && !udpPortListening(SCSYNTH_PORT) && !udpPortListening(SUPERDIRT_PORT)) {
+				dbg("foreign stack vanished during recheck; booting our own");
+			} else if (re.alive) {
+				return "SC is running outside this plugin instance (OSC /status answers on 57110); no owned stdin. "
+					+ "Another pi session or a manual start-tidal.sh owns the stack — use its session, or stop it before restarting here.";
+			} else {
+				return "SC ports are held by an unowned stack that is not answering OSC (likely mid-boot or hung; "
+					+ (wasAlive ? "was answering moments ago" : "port bound, no /status reply") + "). "
+					+ "Check for sclang/scsynth processes and stop them before restarting here.";
+			}
 		}
 		// scsynth is UDP-silent for 30-90s after spawn (README: pipe backpressure
 		// while sclang churns). If the port is bound the server is NOT dead —
@@ -436,7 +464,7 @@ export default async function (pi: ExtensionAPI) {
 		} catch { /* best effort */ }
 	}
 
-	async function startRecording(cwd: string): Promise<string> {
+	async function startRecording(cwd: string, name?: string): Promise<string> {
 		if (recActive) return `already recording: ${recPath}`;
 		const stackMsg = await ensureStack(cwd);
 		if (!stackMsg.includes("ready")) return `cannot record: ${stackMsg}`;
@@ -444,8 +472,18 @@ export default async function (pi: ExtensionAPI) {
 		try { fs.mkdirSync(dir, { recursive: true }); } catch { /* exists */ }
 		const d = new Date();
 		const pad = (n: number) => String(n).padStart(2, "0");
-		const name = `jam-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
-		recPath = path.join(dir, name + ".wav");
+		const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+		// A take can be named: "Jolene in the Riddim" -> jolene-in-the-riddim-20261004-1137.
+		// The timestamp stays so takes sort chronologically and never collide; the
+		// slug is what a human (and the album dir) actually reads. Falls back to
+		// the anonymous `jam-` prefix when no name is given.
+		const slug = (name ?? "")
+			.toLowerCase()
+			.replace(/[^a-z0-9]+/g, "-")
+			.replace(/^-+|-+$/g, "")
+			.slice(0, 60);
+		const stem = (slug ? slug + "-" : "jam-") + stamp;
+		recPath = path.join(dir, stem + ".wav");
 		recStartedAt = Date.now();
 		recVia = null;
 		if (sclangProc?.stdin) {
@@ -716,6 +754,11 @@ export default async function (pi: ExtensionAPI) {
 			if (!replProc || !replReady) return resolve("(repl not ready)");
 			const BEGIN = "__PI_TIDAL_BEGIN__", END = "__PI_TIDAL_END__";
 			const cmd = `putStrLn "${BEGIN}" >> (${cmds.join(" >> ")}) >> putStrLn "${END}"`;
+			// Drop everything buffered so far: BEGIN/END markers from earlier queries
+			// linger in the rolling buffer, and indexOf(BEGIN) would match the OLDEST
+			// pair — returning stale output (e.g. an unchanged 'list') while looking
+			// freshly captured. Only output produced after this write is considered.
+			replStdoutBuf = "";
 			try { replProc.stdin?.write(cmd + "\n"); } catch { return resolve("(repl stdin closed)"); }
 			const deadline = Date.now() + timeoutMs;
 			const poll = setInterval(() => {
@@ -790,16 +833,20 @@ export default async function (pi: ExtensionAPI) {
 		description:
 			"Start/stop recording the stack's audio output. Preferred over shelling out to pw-record: " +
 			"uses s.record (clean scsynth tap, no system audio or output-volume clipping), writes " +
-			"recordings/jam-YYYYMMDD-HHMM.wav plus a FLAC copy on stop, and maintains a markers sidecar. " +
+			"recordings/<name>-YYYYMMDD-HHMM.wav (default prefix `jam-`) plus a FLAC copy on stop, and maintains a markers sidecar. " +
+			"Pass `name` to title the take — it is slugified, so 'Jolene in the Riddim' -> jolene-in-the-riddim-20261004-1137. " +
 			"Use start before a take and stop when it's over; recording auto-stops on session shutdown.",
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("start"), Type.Literal("stop"), Type.Literal("status")], {
 				description: "start, stop, or query recording state",
 			}),
+			name: Type.Optional(Type.String({
+				description: "Optional title for the take (slugified into the filename), e.g. 'Jolene in the Riddim'",
+			})),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			let msg: string;
-			if (params.action === "start") msg = await startRecording(ctx.cwd);
+			if (params.action === "start") msg = await startRecording(ctx.cwd, params.name);
 			else if (params.action === "stop") msg = await stopRecording();
 			else msg = recActive
 				? `recording ${path.basename(recPath)} via ${recVia}, ${Math.round((Date.now() - recStartedAt) / 1000)}s`
@@ -1193,7 +1240,7 @@ export default async function (pi: ExtensionAPI) {
 			const replUp = !!replProc && replReady;
 			updateWidget();
 			const parts = [
-				`scsynth: ${sc.alive ? `up, ${sc.synths} synths, ${sc.ugens} ugens` : "DOWN"}`,
+				`scsynth: ${sc.alive ? `up, ${sc.synths} synths, ${sc.ugens} ugens${weSpawnedSclang ? "" : " (foreign stack, not owned by this session)"}` : "DOWN"}`,
 				`superdirt(57120): ${dirt ? "listening" : "not listening"}`,
 				`repl: ${replUp ? "ready" : replProc ? "booting" : "down"}${replUp ? ` (${Math.round((Date.now() - replBootedAt) / 1000)}s)` : ""}`,
 				`last eval: ${lastLabel}`,
@@ -1247,7 +1294,7 @@ export default async function (pi: ExtensionAPI) {
 			}
 			const sc = await queryScsynth();
 			scsynthCached = sc;
-			const msg = `scsynth ${sc.alive ? `up (${sc.synths} synths)` : "down"} | superdirt ${udpPortListening(SUPERDIRT_PORT) ? "up" : "down"} | repl ${replReady ? "ready" : "down"} | last: ${lastLabel}`;
+			const msg = `scsynth ${sc.alive ? `up (${sc.synths} synths)${weSpawnedSclang ? "" : " foreign"}` : "down"} | superdirt ${udpPortListening(SUPERDIRT_PORT) ? "up" : "down"} | repl ${replReady ? "ready" : "down"} | last: ${lastLabel}`;
 			ctx.ui.notify(`tidal: ${msg}`, sc.alive ? "info" : "warning");
 			updateWidget();
 		},
