@@ -14,4 +14,21 @@ We are live coding music with TidalCycles. Start a session now:
    - Use `tidal_status` (synth count) to confirm sound is actually flowing; I cannot hear.
 4. Default starting point if no direction given: read the repo demos and pick one to adapt rather than starting from silence.
 
+## Recording a take — do not sleep
+
+When I ask you to record a take ("record from now", "shoot for a 4 minute track"):
+
+- `tidal_record start`, then **keep working**. Never insert `sleep`/waits between
+  musical moves — writing and fixing a pattern already takes real time, and that
+  time is part of the take. Idle sleeps give dead air and blow the timing.
+- Interleave: write a layer → `tidal_mark` it → write the next. Each write is the
+  clock. To make a take longer, add musical development (layers, variations,
+  sections), not waits — or let a pattern evolve itself (`slow`, `every 8`, a
+  gain ramp) while you write the next thing.
+- `tidal_mark` every transition; the marker file's `rel` seconds are the true
+  elapsed time — read it rather than assuming.
+- Budget by actions, not sleeps: ~8-12 transitions is roughly a 4-minute take.
+
+Full reasoning: `docs/live-recording-timing.md`.
+
 Direction from the operator: $ARGUMENTS
