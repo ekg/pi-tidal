@@ -20,6 +20,20 @@ agent: edits .tidal chunk  →  save  →  chunk auto-evaluates  →  sound chan
 - **Self-healing stack**: a watchdog revives SuperDirt if the audio server dies and re-fires the recent chunks so the music resumes. On suspend-capable machines the sclang process runs under `systemd-inhibit` (block mode) so suspend can't kill audio mid-set.
 - **`/jam` prompt template**: one command that boots the stack and puts the agent into "expecting musical direction" mode.
 
+## Scene decks
+
+Scene files combine local d1–d16 lanes with embedded SC modulation. Load/restart
+begins at local cycle zero; file saves preserve phase. A/B decks own independent
+routing and effects, share tempo, and crossfade without resetting the global
+clock. See [scene format, commands, ownership and validation](docs/scenes.md).
+
+```
+/tidal scene load A 159.tidal
+/tidal scene load B 160.tidal
+/tidal scene mix 1 4
+/tidal scene leave
+```
+
 ## Install
 
 ### 1. Prerequisites (once per machine)
@@ -97,7 +111,7 @@ or just talk normally and the stack boots lazily on the first Tidal action. `hus
 Everything below was hit in production on a Framework laptop, Ubuntu 24.04, PipeWire 1.0.5, SC 3.13.0, tidal 1.10.1.
 
 - **scsynth SIGABRT at boot** — scsynth links `libjack.so.0` from jackd2, which auto-spawns a `jackd` that fights PipeWire for the ALSA device (`hw:0`). The extension points `LD_LIBRARY_PATH` at PipeWire's own libjack (`/usr/lib/x86_64-linux-gnu/pipewire-0.3/jack`) when that directory exists. Symptom in the wild: `jackdmp ... ALSA: Cannot open PCM device alsa_pcm` right before the abort.
-- **`Server 'localhost' exited with exit code 0`** — a *clean* scsynth exit with no `/quit` received. On this setup the common cause is a **suspend/resume cycle**: PipeWire drops the JACK client on resume and scsynth exits(0). Mitigations: `systemd-inhibit` around sclang (built in), and the watchdog revives the stack + re-fires recent chunks.
+- **`Server 'localhost' exited with exit code 0`** — do **not** assume a clean exit. SC's process callback can obscure signal termination. A foreground wrapper that logs the engine's actual shell status distinguishes SIGKILL (137) from a real exit(0). Inspect `/proc/<engine-pid>/limits`, OOM logs and scheduling policy. An inherited 200ms hard `Max realtime timeout` was observed alongside repeated SIGKILLs on this machine; project-local non-RT client scheduling is a reversible diagnostic/workaround, not a global PipeWire change. Suspend/resume can also disconnect JACK: `systemd-inhibit` and the watchdog mitigate that different failure. Reloading Pi alone cannot fix inherited limits or unhealthy DSP.
 - **scsynth silent to UDP for 30–90s after spawn** — while sclang churns through class compile + ~450MB of sample reads, scsynth's stdout pipe backs up into the busy interpreter and its network replies stall. Don't health-check the server with OSC during that window; watch sclang's own post output (`SuperDirt: listening on port 57120`) instead — that's what the extension does.
 - **`Could not open UDP port 57120`** — another sclang may hold the port. Inspect its owner before stopping it; never kill all audio processes by name. The extension terminates only its owned process tree (including scsynth grandchildren).
 - **Pi `/reload`** — stops the owned audio stack because a new extension cannot inherit the old stdin handle. Shutdown waits for the full owned tree to exit (TERM, then bounded KILL if necessary), verifies PID identities, and cancels delayed link/REPL timers. Boot, restart and shutdown are serialized. The next tool boots a fresh controlled stack; occupied unowned ports cause a refusal, not a duplicate boot. When upgrading from older versions, check for an orphan left by the old shutdown handler.

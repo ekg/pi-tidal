@@ -37,6 +37,18 @@ export default async function (pi: ExtensionAPI) {
 	const { formatScStatus } = await importFreshModule(path.join(PACKAGE_DIR, "lib/sc-status.mjs"));
 	const { cleanReplError } = await importFreshModule(path.join(PACKAGE_DIR, "lib/repl-error.mjs"));
 	const { selectStereoSinkPorts } = await importFreshModule(path.join(PACKAGE_DIR, "lib/output-routing.mjs"));
+	const { createBootSignals, inspectBootLog, BOOT_TIMEOUT_MS, REPL_TIMEOUT_MS, ENSURE_TIMEOUT_MS, isStackReady } = await importFreshModule(path.join(PACKAGE_DIR, "lib/boot-readiness.mjs"));
+	const { createSceneRegistry, isSceneFile, extractSc, deckIndex, patternExpression, sceneCommands, stopCommands } = await importFreshModule(path.join(PACKAGE_DIR, "lib/scenes.mjs"));
+	const { tidalStatements } = await importFreshModule(path.join(PACKAGE_DIR, "lib/tidal-chunks.mjs"));
+	const { replCommand } = await importFreshModule(path.join(PACKAGE_DIR, "lib/repl-command.mjs"));
+	const scenes = createSceneRegistry();
+	const sceneQueue = createLifecycleQueue();
+	const queryQueue = createLifecycleQueue();
+	const bootSignals = createBootSignals();
+	let bootLogBefore = 0;
+	let bootStage = "idle";
+	let scOutputBuffer = "";
+	let scRequestNumber = 0;
 	// ---------- state ----------
 	const lifecycle = createLifecycleQueue();
 	let closing = false;
@@ -177,6 +189,7 @@ export default async function (pi: ExtensionAPI) {
 		sclangProc = null;
 		replProc = null;
 		replReady = false;
+		sceneController.resetTransport();
 	}
 
 	async function startSclang(): Promise<void> {
@@ -220,6 +233,12 @@ export default async function (pi: ExtensionAPI) {
 		sclangTail = [];
 		sclangSeq = 0;
 		bootSeq = 0; // marker for this boot
+		bootSignals.reset();
+		scOutputBuffer = "";
+		scBootError = "";
+		bootStage = "SuperCollider startup / DSP self-test";
+		const bootLog = path.join(currentCwd, "sc/boot.log");
+		bootLogBefore = fs.existsSync(bootLog) ? fs.statSync(bootLog).mtimeMs : 0;
 		// scsynth does not auto-connect its jack ports under pw-jack. Prefer
 		// the Tidal Main virtual sink, whose PipeWire playback stream follows
 		// Ubuntu's selected output. Fall back to XREAL/default if unavailable.
@@ -244,6 +263,8 @@ export default async function (pi: ExtensionAPI) {
 		}, 20_000);
 		sclangProc.stdout?.on("data", (d: Buffer) => {
 			if (sclangProc !== owner) return;
+			bootSignals.feed(d.toString());
+			scOutputBuffer = (scOutputBuffer + d.toString()).slice(-64_000);
 			for (const line of d.toString().split("\n")) {
 				sclangSeq++;
 				sclangTail.push(line);
@@ -306,23 +327,20 @@ export default async function (pi: ExtensionAPI) {
 	function serverListeningSinceBoot(): boolean {
 		// SuperDirt's port binds early; our layer finishes later and writes "done".
 		// Require BOTH, and refuse to report ready while a boot stage is failing.
-		const portUp = sclangLinesSince(bootSeq).some((l) => l.includes("listening on port 57120"));
-		if (!portUp) return false;
+		if (!bootSignals.listening) return false;
+		const logPath = path.join(currentCwd, "sc/boot.log");
+		if (!fs.existsSync(logPath)) return true; // stock SuperDirt
 		try {
-					const boot = fs.readFileSync(path.join(currentCwd, "sc/boot.log"), "utf8").trim().split("\n");
-			const tail = boot.slice(-14);
-			if (boot.some((l) => l.includes("FAIL"))) {
-				scBootError = boot.filter((l) => l.includes("FAIL")).slice(-2).join("\n");
-				return false;                       // surfacing this is the whole point
-			}
-			return tail.some((l) => l.includes("done"));
-		} catch {
-			return true;                            // no boot.log: stock SuperDirt is fine
-		}
+			const state = inspectBootLog(fs.readFileSync(logPath, "utf8"), {
+				fresh: fs.statSync(logPath).mtimeMs > bootLogBefore,
+			});
+			scBootError = state.error;
+			return state.ready;
+		} catch { return false; } // an unreadable project log is not proof of readiness
 	}
 
 	function serverDiedSinceBoot(): boolean {
-		return sclangLinesSince(bootSeq).some((l) => l.includes("exited with exit code"));
+		return bootSignals.died;
 	}
 
 	// Real implementation (may block while a stack boots).
@@ -354,32 +372,22 @@ export default async function (pi: ExtensionAPI) {
 		// scsynth is UDP-silent for 30-90s after spawn (README: pipe backpressure
 		// while sclang churns). If the port is bound the server is NOT dead —
 		// treat it as up instead of killStack()ing a healthy stack and rebooting.
-		if (!st.alive && !udpPortListening(SCSYNTH_PORT)) {
-			// NOTE: do NOT wait on OSC /status replies here. While sclang churns
-			// through its startup (synthdef compile + 450MB sample read), scsynth's
-			// stdout pipe backs up into the busy interpreter and scsynth stops
-			// answering UDP for 30-90s. sclang's own post output ("SuperDirt:
-			// listening on port 57120") is the reliable boot signal.
-			for (let attempt = 1; attempt <= 2; attempt++) {
-				await startSclang();
-				const ok = await waitFor(() => serverListeningSinceBoot() || serverDiedSinceBoot(), 150_000, 2000);
-				dbg("boot wait result:", ok, "died:", serverDiedSinceBoot());
-				if (ok && !serverDiedSinceBoot()) break;
-				if (attempt === 2) return "scsynth did not boot (2 attempts)"
-					+ (scBootError ? "; failing boot stage:\n" + scBootError : "")
-					+ "; sclang tail:\n" + sclangTail.slice(-12).join("\n");
-				dbg("scsynth boot attempt failed, retrying");
-			}
-		}
-		if (!udpPortListening(SUPERDIRT_PORT)) {
-			await waitFor(() => udpPortListening(SUPERDIRT_PORT), 60_000);
-		}
+		if (!sclangProc) await startSclang();
+		// Start GHCi concurrently with SC; neither process needs the other to
+		// finish compiling. Never reboot merely because a healthy boot is slow.
 		if (!replProc) startRepl(cwd);
-		const replOk = await waitFor(() => replReady, 90_000, 1000);
+		const scOk = await waitFor(() => serverListeningSinceBoot() || serverDiedSinceBoot() || !!scBootError, BOOT_TIMEOUT_MS, 250);
+		if (!scOk || serverDiedSinceBoot() || scBootError) {
+			return `SC startup failed at ${bootStage}: ${scBootError || (serverDiedSinceBoot() ? "server exited" : "deadline exceeded")}; sclang tail:\n${sclangTail.slice(-12).join("\n")}`;
+		}
+		bootStage = "Tidal REPL handshake";
+		const replOk = await waitFor(() => replReady, REPL_TIMEOUT_MS, 250);
 		scsynthCached = await queryScsynth();
 		updateWidget();
 		startWatchdog();
-		return replOk ? "stack ready" : "repl did not become ready within 90s";
+		if (replOk && scenes.entries().length && !sceneController.runtimeReady) await sceneController.restore();
+		bootStage = replOk ? "ready" : "Tidal REPL handshake failed";
+		return replOk ? "stack ready" : "Tidal REPL handshake timed out; SC passed its audio self-test";
 	}
 
 	// Watchdog: if scsynth dies while we own the stack (typically suspend/resume
@@ -415,16 +423,17 @@ export default async function (pi: ExtensionAPI) {
 				await lifecycle(() => teardown());
 				const msg = await ensureStack(cwd);
 				lastReviveAt = Date.now();
-				if (msg.includes("ready")) {
+				if (isStackReady(msg)) {
+					const hadScenes = scenes.entries().length > 0;
 					// restore state: globals first (hush/setcps/do-blocks), then each
 					// stream's latest chunk in numeric order — silences stay silent
-					for (const c of [...lastChunks]) {
+					for (const c of hadScenes ? [] : [...lastChunks]) {
 						if (replReady) sendChunk(c);
 					}
 					const streams = [...streamChunks.entries()].sort(
 						(a, b) => (parseInt(a[0].slice(1)) || 0) - (parseInt(b[0].slice(1)) || 0),
 					);
-					for (const [, c] of streams) {
+					for (const [, c] of hadScenes ? [] : streams) {
 						if (replReady) sendChunk(c);
 					}
 					updateWidget("stack revived + state restored");
@@ -468,7 +477,7 @@ export default async function (pi: ExtensionAPI) {
 	async function startRecording(cwd: string, name?: string): Promise<string> {
 		if (recActive) return `already recording: ${recPath}`;
 		const stackMsg = await ensureStack(cwd);
-		if (!stackMsg.includes("ready")) return `cannot record: ${stackMsg}`;
+		if (!isStackReady(stackMsg)) return `cannot record: ${stackMsg}`;
 		const dir = path.join(cwd, "recordings");
 		try { fs.mkdirSync(dir, { recursive: true }); } catch { /* exists */ }
 		const d = new Date();
@@ -550,15 +559,9 @@ export default async function (pi: ExtensionAPI) {
 
 	function sendChunk(chunk: string): boolean {
 		if (!replProc?.stdin || !replReady) return false;
-		// This REPL merges the lines of a :{...:} block into ONE expression, so a
-		// chunk with several statements (e.g. a comment glued to d1..d4) parses
-		// as `# gain 1.0 d2 $ ...` and silently kills every stream in it — the
-		// "buried beat" bug. Send statement-per-statement: strip comments, one
-		// block per statement.
-		const stmts = chunk
-			.split("\n")
-			.map((l) => l.trim())
-			.filter((l) => l.length > 0 && !l.startsWith("--"));
+		// SC blocks are scene-only; never forward them (even fragments) to GHCi.
+		if (extractSc(chunk).sc.length) throw new Error("Embedded SC requires tidal_scene and a -- @scene header");
+		const stmts = tidalStatements(chunk);
 		if (stmts.length === 0) return true;
 		for (const line of stmts) {
 			replProc.stdin.write(":{\n" + line + "\n:}\n");
@@ -596,11 +599,29 @@ export default async function (pi: ExtensionAPI) {
 		);
 	}
 
-	function evalChangedChunks(filePath: string, cwd: string): void {
+	async function evalChangedChunks(filePath: string, cwd: string): Promise<void> {
 		let text: string;
 		try {
 			text = fs.readFileSync(filePath, "utf-8");
 		} catch {
+			return;
+		}
+		try {
+			const active = scenes.entries().filter(([, record]: any) => record.file === path.resolve(filePath));
+			if (isSceneFile(text) || active.length) {
+				// Saving an inactive scene must not claim a deck or restart audio.
+				for (const [deck] of active) await sceneQueue(async () => {
+					const status = await ensureStack(cwd);
+					if (!isStackReady(status)) throw new Error(status);
+					await sceneController.activate(scenes.plan(deck, filePath, text, false));
+				});
+				snapshots.set(filePath, [text]);
+				return;
+			}
+			if (sceneController.runtimeReady) throw new Error("Legacy .tidal edits are disabled while scene decks own the orbits; use tidal_scene action=leave first");
+			if (extractSc(text).sc.length) throw new Error("Embedded SC requires a -- @scene header");
+		} catch (error) {
+			pi.sendUserMessage(`[tidal scene] ${path.basename(filePath)} edit not activated: ${error}`, { deliverAs: "followUp" });
 			return;
 		}
 		const chunks = splitChunks(text);
@@ -718,6 +739,15 @@ export default async function (pi: ExtensionAPI) {
 		widgetSink = (lines) => {
 			try { ctx.ui.setWidget("tidal", lines); } catch { /* ignore */ }
 		};
+		// Recover only the active branch's latest scene snapshot, never unsent
+		// file edits. The next stack operation restores both decks from zero.
+		const saved = ctx.sessionManager?.getBranch().filter((entry: any) => entry.type === "custom" && entry.customType === "tidal-scenes").at(-1) as any;
+		if (saved?.data?.decks) {
+			try {
+				for (const [deck, record] of saved.data.decks) scenes.commit(scenes.plan(deck, record.file, record.text, true));
+				scenes.setMix(saved.data.mix);
+			} catch { scenes.clear(); }
+		}
 		// snapshot existing .tidal files so first edits diff cleanly
 		try {
 			for (const f of fs.readdirSync(ctx.cwd)) {
@@ -740,8 +770,9 @@ export default async function (pi: ExtensionAPI) {
 	// ---------- auto-eval on edit ----------
 	pi.on("tool_result", async (event, ctx) => {
 		if (event.toolName !== "write" && event.toolName !== "edit") return;
-		const p = (event.input as { path?: string } | undefined)?.path;
-		if (!p || !p.endsWith(".tidal")) return;
+		const inputPath = (event.input as { path?: string } | undefined)?.path;
+		if (event.isError || !inputPath || !inputPath.endsWith(".tidal")) return;
+		const p = path.resolve(ctx.cwd, inputPath);
 		// only auto-eval files inside the project
 		const rel = path.relative(ctx.cwd, p);
 		if (rel.startsWith("..")) return;
@@ -753,11 +784,11 @@ export default async function (pi: ExtensionAPI) {
 	// workaround (see startRepl) is poking stdin, which makes ghci flush its
 	// buffered output when it processes the next line. replQuery sends a
 	// marker-delimited command and pokes until the end marker shows up.
-	function replQuery(cmds: string[], timeoutMs = 3000): Promise<string> {
-		return new Promise((resolve) => {
+	function replQuery(cmds: string[], timeoutMs = 5000): Promise<string> {
+		return queryQueue(() => new Promise<string>((resolve) => {
 			if (!replProc || !replReady) return resolve("(repl not ready)");
 			const BEGIN = "__PI_TIDAL_BEGIN__", END = "__PI_TIDAL_END__";
-			const cmd = `putStrLn "${BEGIN}" >> (${cmds.join(" >> ")}) >> putStrLn "${END}"`;
+			const cmd = replCommand(cmds, BEGIN, END);
 			// Drop everything buffered so far: BEGIN/END markers from earlier queries
 			// linger in the rolling buffer, and indexOf(BEGIN) would match the OLDEST
 			// pair — returning stale output (e.g. an unchanged 'list') while looking
@@ -779,8 +810,55 @@ export default async function (pi: ExtensionAPI) {
 					try { replProc?.stdin?.write("\n"); } catch { /* gone */ } // flush poke
 				}
 			}, 250);
-		});
+		}));
 	}
+
+	// ---------- scene ownership ----------
+	function writeRepl(statement: string): void {
+		if (!replReady || !replProc?.stdin?.writable) throw new Error("Tidal REPL is not writable");
+		replProc.stdin.write(`:{\n${statement}\n:}\n`);
+	}
+
+	async function sceneSc(body: (token: string) => string, asynchronous = false): Promise<void> {
+		const token = `PI_SCENE_${++scRequestNumber}_${Date.now()}`;
+		const source = body(JSON.stringify(token));
+		const done = asynchronous ? "" : `; ${JSON.stringify(token + ":ok")}.postln`;
+		scTransport.send(`(try { ${source}${done} } { |error| (${JSON.stringify(token + ":error:")} ++ error.errorString).postln })`, token);
+		const ok = await waitFor(() => scOutputBuffer.includes(token + ":ok") || scOutputBuffer.includes(token + ":error:"), 10_000, 25);
+		if (!ok) throw new Error(`SC scene request failed to acknowledge (compile error or stopped interpreter): ${scOutputBuffer.slice(-1600)}`);
+		const error = scOutputBuffer.match(new RegExp(token + ":error:([^\\n]*)"));
+		if (error) throw new Error(error[1]);
+	}
+
+	const { createSceneController } = await importFreshModule(path.join(PACKAGE_DIR, "lib/scene-controller.mjs"));
+	const sceneController = createSceneController({
+		registry: scenes, runtimePath: path.join(PACKAGE_DIR, "sc/scenes.scd"),
+		ensure: ensureStack, ready: isStackReady, writeRepl, queryRepl: replQuery,
+		sc: sceneSc, hush: () => sendChunk("hush"),
+		label: (text: string) => { lastLabel = text; updateWidget(); persistScenes(); },
+		deckIndex, patternExpression, sceneCommands, stopCommands,
+	});
+
+	function persistScenes(): void {
+		pi.appendEntry?.("tidal-scenes", { decks: scenes.entries(), mix: scenes.mix });
+	}
+
+	pi.registerTool({
+		name: "tidal_scene", label: "Tidal Scene",
+		description: "Load a .tidal scene with -- @scene metadata and {- @sc ... -} blocks onto deck A/B. Load/restart starts at local cycle zero on a future bar; edit preserves phase. Mix crossfades independent scene FX; stop frees owned nodes; leave restores legacy orbit routing. Both decks share tempo. SC blocks use scene[\\mod].value({ |cycles| [toneHz, sat, wet, gain] }).",
+		parameters: Type.Object({
+			action: Type.Union([Type.Literal("load"), Type.Literal("restart"), Type.Literal("edit"), Type.Literal("mix"), Type.Literal("stop"), Type.Literal("status"), Type.Literal("leave")]),
+			deck: Type.Optional(Type.Union([Type.Literal("A"), Type.Literal("B")])),
+			file: Type.Optional(Type.String()),
+			mix: Type.Optional(Type.Number({ description: "0=A, 1=B; both clocks continue" })),
+			cycles: Type.Optional(Type.Number({ description: "Crossfade duration at the current tempo" })),
+		}),
+		async execute(_id, params, _signal, _update, ctx) {
+			const text = await sceneQueue(() => sceneController.action(params, ctx.cwd));
+			persistScenes();
+			return { content: [{ type: "text", text }], details: { decks: scenes.entries(), mix: scenes.mix } };
+		},
+	});
 
 	// ---------- tools ----------
 	// Bounded wrapper: an unbounded wait here makes EVERY tidal_* tool hang with no
@@ -797,8 +875,8 @@ export default async function (pi: ExtensionAPI) {
 		let timer: ReturnType<typeof setTimeout>;
 		const timeout = new Promise<string>((resolve) => {
 			timer = setTimeout(() => resolve(
-				"stack did not become ready within 120s; boot may still be in progress. " +
-				"Inspect sc/boot.log and owned process state; do not launch a second sclang."), 120_000);
+				`startup deadline exceeded (${ENSURE_TIMEOUT_MS / 1000}s), stage: ${bootStage}. ` +
+				"The owned boot is still tracked; do not launch a second sclang."), ENSURE_TIMEOUT_MS);
 		});
 		try { return await Promise.race([ensureFlight, timeout]); }
 		finally { clearTimeout(timer!); }
@@ -826,6 +904,7 @@ export default async function (pi: ExtensionAPI) {
 				`last eval: ${lastLabel}`,
 				`active streams (from Tidal 'list'):\n${listOut}`,
 				`tracked .tidal files: ${files.length ? files.join(", ") : "(none)"}`,
+				await sceneController.action({ action: "status" }, ctx.cwd),
 			].join("\n");
 			return { content: [{ type: "text", text }], details: {} };
 		},
@@ -897,7 +976,7 @@ export default async function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const status = await ensureStack(ctx.cwd);
-			if (!status.includes("ready")) {
+			if (!isStackReady(status)) {
 				return { content: [{ type: "text", text: `tidal_sc failed: ${status}` }], details: {} };
 			}
 			// weSpawnedSclang means the stdin pipe is ours to write to
@@ -944,7 +1023,7 @@ export default async function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const status = await ensureStack(ctx.cwd);
-			if (!status.includes("ready")) {
+			if (!isStackReady(status)) {
 				return { content: [{ type: "text", text: `tidal_param failed: ${status}` }], details: {} };
 			}
 			const fn = (t: string) => (t === "i" ? "pI" : t === "s" ? "pS" : "pF");
@@ -969,10 +1048,10 @@ export default async function (pi: ExtensionAPI) {
 			"Restart the Tidal (ghci) REPL so it reloads BootTidal.hs, and by doing so " +
 			"re-establish the OSC path to SuperDirt. Needed after the audio stack is " +
 			"restarted (the old REPL looks healthy and reports active streams while " +
-			"sending nothing), and after editing BootTidal.hs. Patterns do not survive.",
+			"sending nothing), and after editing BootTidal.hs. Scene decks are restored from local zero; legacy patterns must be re-sent.",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			return lifecycle(async () => {
+			return sceneQueue(() => lifecycle(async () => {
 				if (closing) throw new Error("plugin is shutting down");
 				const old = replProc;
 				if (old?.pid && old.exitCode === null && old.signalCode === null) {
@@ -981,16 +1060,17 @@ export default async function (pi: ExtensionAPI) {
 				replProc = null;
 				replReady = false;
 				startRepl(ctx.cwd);
-				const ready = await waitFor(() => replReady, 90_000, 1000);
+				const ready = await waitFor(() => replReady, REPL_TIMEOUT_MS, 250);
+				if (ready && scenes.entries().length) await sceneController.restore();
 				lastLabel = "tidal_repl";
 				updateWidget(ready ? "repl ready" : "repl failed");
 				return {
 					content: [{ type: "text", text: ready
-						? "owned REPL restarted and ready (patterns must be re-sent)"
+						? "owned REPL restarted and ready (scene decks restored; legacy patterns must be re-sent)"
 						: "REPL restart timed out" }],
 					details: {},
 				};
-			});
+			}));
 		},
 	});
 
@@ -1007,9 +1087,10 @@ export default async function (pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const status = await ensureStack(ctx.cwd);
-			if (!status.includes("ready")) {
+			if (!isStackReady(status)) {
 				return { content: [{ type: "text", text: `tidal_sc_reload failed: ${status}` }], details: {} };
 			}
+			if (sceneController.runtimeReady) throw new Error("Leave scene mode before reloading project routing (tidal_scene action=leave)");
 			if (!sclangProc || !sclangProc.stdin) {
 				return { content: [{ type: "text", text: "tidal_sc_reload: no sclang stdin available" }], details: {} };
 			}
@@ -1040,7 +1121,7 @@ export default async function (pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const status = await ensureStack(ctx.cwd);
-			if (!status.includes("ready")) {
+			if (!isStackReady(status)) {
 				return { content: [{ type: "text", text: `tidal_sc_status failed: ${status}` }], details: {} };
 			}
 			let log = "";
@@ -1089,9 +1170,10 @@ export default async function (pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const status = await ensureStack(ctx.cwd);
-			if (!status.includes("ready")) {
+			if (!isStackReady(status)) {
 				return { content: [{ type: "text", text: `tidal_panic: ${status}` }], details: {} };
 			}
+			if (sceneController.runtimeReady) await sceneQueue(() => sceneController.leave());
 			sendChunk("hush");                       // stop events on the Tidal side
 			let scOut = "(no sclang stdin)";
 			if (sclangProc?.stdin) {
@@ -1129,51 +1211,29 @@ export default async function (pi: ExtensionAPI) {
 			})),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			return lifecycle(async () => {
-			if (closing) throw new Error("plugin is shutting down");
-			currentCwd = ctx.cwd;
-			if (watchdog) { clearInterval(watchdog); watchdog = null; }
-			const before = fs.existsSync(path.join(ctx.cwd, "sc/boot.log"))
-				? fs.statSync(path.join(ctx.cwd, "sc/boot.log")).mtimeMs : 0;
-			await startSclang();
-			startRepl(ctx.cwd);
-			// wait for a FRESH boot log ending in "done"
-			let ok = false;
-			for (let i = 0; i < 40; i++) {
-				if (closing) throw new Error("plugin is shutting down");
-				await new Promise((r) => setTimeout(r, 3000));
-				try {
-					const p = path.join(ctx.cwd, "sc/boot.log");
-					if (!fs.existsSync(p) || fs.statSync(p).mtimeMs <= before) continue;
-					const tail = fs.readFileSync(p, "utf8").trim().split("\n");
-					if (tail.some((l) => l.includes("FAIL"))) {
-						scBootError = tail.filter((l) => l.includes("FAIL")).slice(-2).join("\n");
-						return { content: [{ type: "text", text: `restart failed at a boot stage:\n${scBootError}` }], details: {} };
+			return sceneQueue(async () => {
+				const status = await lifecycle(async () => {
+					if (closing) throw new Error("plugin is shutting down");
+					if (watchdog) { clearInterval(watchdog); watchdog = null; }
+					await killOwnStack();
+					return ensureStackInner(ctx.cwd);
+				});
+				if (!isStackReady(status)) throw new Error(status);
+				let resent = scenes.entries().length ? "scene decks (SC + patterns, local zero)" : "none";
+				const target = params.file ? path.resolve(ctx.cwd, params.file) : scenes.entries().length ? null : lastStateFile;
+				if (target) {
+					const text = fs.readFileSync(target, "utf8");
+					if (isSceneFile(text)) await sceneController.activate(scenes.plan("A", target, text, true));
+					else {
+						if (sceneController.runtimeReady) throw new Error("Leave scene mode before replaying a legacy file");
+						for (const chunk of splitChunks(text)) sendChunk(chunk);
+						lastStateFile = target;
 					}
-					if (tail.some((l) => l.includes("done"))) { ok = true; break; }
-				} catch { /* keep waiting */ }
-			}
-			if (!ok) {
-				return { content: [{ type: "text", text: "restart: boot never reached 'done' (see sc/boot.log)" }], details: {} };
-			}
-			if (!await waitFor(() => replReady, 90_000, 1000)) {
-				return { content: [{ type: "text", text: "restart: SC booted but Tidal REPL never became ready" }], details: {} };
-			}
-			let resent = "none";
-			const target = params.file ?? lastStateFile;
-			if (target) {
-				for (const chunk of fs.readFileSync(target, "utf8").split(/\n\s*\n/)) {
-					const c = chunk.trim();
-					if (c && !c.split("\n").every((l) => l.trim().startsWith("--"))) sendChunk(c);
+					resent = target;
 				}
-				lastStateFile = target;
-				resent = target;
-			}
-			scsynthCached = await queryScsynth();
-			startWatchdog();
-			lastLabel = "tidal_restart";
-			updateWidget("stack restarted");
-			return { content: [{ type: "text", text: `stack restarted (boot ok, REPL fresh); re-sent ${resent}` }], details: {} };
+				lastLabel = "tidal_restart";
+				updateWidget("stack restarted");
+				return { content: [{ type: "text", text: `stack restarted; re-sent ${resent}` }], details: {} };
 			});
 		},
 	});
@@ -1189,11 +1249,20 @@ export default async function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const status = await ensureStack(ctx.cwd);
-			if (!status.includes("ready")) {
+			if (!isStackReady(status)) {
 				return { content: [{ type: "text", text: `tidal_eval failed: ${status}` }], details: {} };
 			}
+			if (sceneController.runtimeReady) {
+				if (params.code.trim() === "hush") await sceneQueue(() => sceneController.leave());
+				else throw new Error("Use tidal_scene while deck mode owns the orbits; leave scene mode before ad-hoc legacy evals");
+			}
+			if (extractSc(params.code).sc.length || isSceneFile(params.code)) throw new Error("Use tidal_scene to load embedded SC scenes");
 			const scripted = params.code.match(/:script\s+(\S+\.tidal)/);
-			if (scripted) lastStateFile = scripted[1];
+			if (scripted) {
+				const target = path.resolve(ctx.cwd, scripted[1]);
+				if (isSceneFile(fs.readFileSync(target, "utf8"))) throw new Error("Use tidal_scene to load scene files, not :script");
+				lastStateFile = target;
+			}
 			for (const chunk of params.code.split(/\n[ \t]*\n/)) {
 				const c = chunk.trim();
 				if (!c || c.split("\n").every((l) => l.trim().startsWith("--"))) continue;
@@ -1215,6 +1284,7 @@ export default async function (pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const status = await ensureStack(ctx.cwd);
+			if (sceneController.runtimeReady) await sceneQueue(() => sceneController.leave());
 			if (sendChunk("hush")) {
 				lastLabel = "hush";
 				updateWidget("hush");
@@ -1259,9 +1329,17 @@ export default async function (pi: ExtensionAPI) {
 
 	// ---------- command ----------
 	pi.registerCommand("tidal", {
-		description: "tidal stack: /tidal [status|hush|restart|record start|record stop|mark <label>]",
+		description: "tidal stack: /tidal status|hush|restart|scene load A file.tidal|scene mix 1 4|scene stop A|scene leave|record start|mark <label>",
 		handler: async (args, ctx) => {
 			const arg = (args || "status").trim();
+			if (arg === "scene" || arg.startsWith("scene ")) {
+				const [, action = "status", ...rest] = arg.split(/\s+/);
+				const params = action === "mix" ? { action, mix: Number(rest[0]), cycles: rest[1] === undefined ? 0 : Number(rest[1]) }
+					: { action, deck: rest[0] ?? "A", file: rest.slice(1).join(" ") || undefined };
+				try { ctx.ui.notify(await sceneQueue(() => sceneController.action(params, ctx.cwd)), "info"); persistScenes(); }
+				catch (error) { ctx.ui.notify(`tidal scene: ${error}`, "error"); }
+				return;
+			}
 			if (arg === "record" || arg.startsWith("record ")) {
 				const sub = arg.slice(6).trim() || "status";
 				if (sub === "start") {
@@ -1286,14 +1364,17 @@ export default async function (pi: ExtensionAPI) {
 				return;
 			}
 			if (arg === "hush") {
+				if (sceneController.runtimeReady) await sceneQueue(() => sceneController.leave());
 				if (sendChunk("hush")) ctx.ui.notify("tidal: hush sent", "info");
 				else ctx.ui.notify("tidal: repl not ready", "error");
 				return;
 			}
 			if (arg === "restart") {
-				await lifecycle(() => teardown());
-				const msg = await ensureStack(ctx.cwd);
-				ctx.ui.notify(`tidal: ${msg}`, msg.includes("ready") ? "info" : "error");
+				const msg = await sceneQueue(async () => {
+					await lifecycle(() => teardown());
+					return ensureStack(ctx.cwd);
+				});
+				ctx.ui.notify(`tidal: ${msg}`, isStackReady(msg) ? "info" : "error");
 				return;
 			}
 			const sc = await queryScsynth();
