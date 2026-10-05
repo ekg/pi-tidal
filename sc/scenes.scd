@@ -1,4 +1,5 @@
-/* Two scene decks, six orbits each. Loaded on demand, never at ordinary boot.
+/* Two rendered scene slots, six orbits each; decks A..Z are logical and map
+   onto the slots through the active pair. Loaded on demand, never at boot.
    Tick synths and note events share SuperDirt's timestamped server bundles.
    The phase bus is extrapolated between 1/16-cycle ticks, not a wall-clock LFO.
    Scene code is a trusted closure |scene|; use scene[\mod] and scene[\own].
@@ -145,7 +146,9 @@ SynthDef(\piSceneMixer, { |inBus = 0, outBus = 0, controlBus = 0, mix = 0, fadeS
             } { |error| acknowledge.value(token, false, error.errorString) };
         }).play(SystemClock);
     },
-    prepare: { |slot, epoch, restart, source, token|
+    // Keep token in its original position: either version of the controller
+    // must work during a plugin reload without restarting the SC process.
+    prepare: { |slot, epoch, restart, source, token, deck|
         Routine({
             var function, context, pending, old;
             try {
@@ -153,6 +156,7 @@ SynthDef(\piSceneMixer, { |inBus = 0, outBus = 0, controlBus = 0, mix = 0, fadeS
                 function = ("{ |scene|\n" ++ source ++ "\n}").compile;
                 if(function.isNil) { Error("scene SC failed to compile").throw };
                 context = makeContext.value(slot, epoch, restart);
+                context[\deck] = deck; // logical deck letter, for status only
                 function.value(context);
                 s.sync;
                 context[\builds].do { |name| Synth.tail(context[\modGroup], name) };
@@ -201,11 +205,13 @@ SynthDef(\piSceneMixer, { |inBus = 0, outBus = 0, controlBus = 0, mix = 0, fadeS
     },
     status: {
         manager[\active].do { |context, slot|
+            var name = if(context.notNil and: { context[\deck].notNil })
+                { context[\deck] } { "slot" ++ slot };
             if(context.notNil) {
                 context[\phase].get { |phase|
-                    "scene % epoch % local-cycle %".format(slot, context[\epoch], phase).postln;
+                    "scene % epoch % local-cycle %".format(name, context[\epoch], phase).postln;
                 };
-            } { "scene % inactive".format(slot).postln };
+            } { "scene % inactive".format(name).postln };
         };
         ("scene mix: " ++ manager[\mix]).postln;
     },

@@ -38,7 +38,7 @@ export default async function (pi: ExtensionAPI) {
 	const { cleanReplError } = await importFreshModule(path.join(PACKAGE_DIR, "lib/repl-error.mjs"));
 	const { selectStereoSinkPorts } = await importFreshModule(path.join(PACKAGE_DIR, "lib/output-routing.mjs"));
 	const { createBootSignals, inspectBootLog, BOOT_TIMEOUT_MS, REPL_TIMEOUT_MS, ENSURE_TIMEOUT_MS, isStackReady } = await importFreshModule(path.join(PACKAGE_DIR, "lib/boot-readiness.mjs"));
-	const { createSceneRegistry, isSceneFile, extractSc, deckIndex, patternExpression, sceneCommands, stopCommands } = await importFreshModule(path.join(PACKAGE_DIR, "lib/scenes.mjs"));
+	const { createSceneRegistry, isSceneFile, extractSc, deckIndex, deckSlot, patternExpression, sceneCommands, stopCommands } = await importFreshModule(path.join(PACKAGE_DIR, "lib/scenes.mjs"));
 	const { tidalStatements } = await importFreshModule(path.join(PACKAGE_DIR, "lib/tidal-chunks.mjs"));
 	const { replCommand } = await importFreshModule(path.join(PACKAGE_DIR, "lib/repl-command.mjs"));
 	const scenes = createSceneRegistry();
@@ -740,10 +740,14 @@ export default async function (pi: ExtensionAPI) {
 			try { ctx.ui.setWidget("tidal", lines); } catch { /* ignore */ }
 		};
 		// Recover only the active branch's latest scene snapshot, never unsent
-		// file edits. The next stack operation restores both decks from zero.
+		// file edits. The next stack operation restores the pair decks from zero;
+		// snapshots without a pair (older versions) default to A/B.
 		const saved = ctx.sessionManager?.getBranch().filter((entry: any) => entry.type === "custom" && entry.customType === "tidal-scenes").at(-1) as any;
 		if (saved?.data?.decks) {
 			try {
+				// Apply the audible pair before validating tempos: parked A/B may
+				// have different cps from each other and from the saved hot pair.
+				if (saved.data.pair !== undefined) scenes.restorePair(saved.data.pair);
 				for (const [deck, record] of saved.data.decks) scenes.commit(scenes.plan(deck, record.file, record.text, true));
 				scenes.setMix(saved.data.mix);
 			} catch { scenes.clear(); }
@@ -836,27 +840,40 @@ export default async function (pi: ExtensionAPI) {
 		ensure: ensureStack, ready: isStackReady, writeRepl, queryRepl: replQuery,
 		sc: sceneSc, hush: () => sendChunk("hush"),
 		label: (text: string) => { lastLabel = text; updateWidget(); persistScenes(); },
-		deckIndex, patternExpression, sceneCommands, stopCommands,
+		deckIndex, deckSlot, patternExpression, sceneCommands, stopCommands,
 	});
 
 	function persistScenes(): void {
-		pi.appendEntry?.("tidal-scenes", { decks: scenes.entries(), mix: scenes.mix });
+		pi.appendEntry?.("tidal-scenes", { decks: scenes.entries(), mix: scenes.mix, pair: scenes.pair });
+	}
+
+	async function leaveScenesForHush(): Promise<void> {
+		await sceneQueue(() => sceneController.leave());
+		// Persist the empty snapshot too: reload must not resurrect hushed decks.
+		persistScenes();
 	}
 
 	pi.registerTool({
 		name: "tidal_scene", label: "Tidal Scene",
-		description: "Load a .tidal scene with -- @scene metadata and {- @sc ... -} blocks onto deck A/B. Load/restart starts at local cycle zero on a future bar; edit preserves phase. Mix crossfades independent scene FX; stop frees owned nodes; leave restores legacy orbit routing. Both decks share tempo. SC blocks use scene[\\mod].value({ |cycles| [toneHz, sat, wet, gain] }).",
+		description:
+			"Load a .tidal scene with -- @scene metadata and {- @sc ... -} blocks onto a logical deck A..Z. " +
+			"Decks in the active crossfade pair (default A/B) are audible; loading any other letter parks it " +
+			"(source saved, Haskell checked, no DSP) until 'select' swaps it into a pair position, parking the deck it displaces. " +
+			"Load/restart starts at local cycle zero on a future bar; edit preserves phase. Mix crossfades the two pair decks; " +
+			"stop frees owned nodes; leave restores legacy orbit routing. Pair decks share tempo. " +
+			"SC blocks use scene[\\mod].value({ |cycles| [toneHz, sat, wet, gain] }).",
 		parameters: Type.Object({
-			action: Type.Union([Type.Literal("load"), Type.Literal("restart"), Type.Literal("edit"), Type.Literal("mix"), Type.Literal("stop"), Type.Literal("status"), Type.Literal("leave")]),
-			deck: Type.Optional(Type.Union([Type.Literal("A"), Type.Literal("B")])),
+			action: Type.Union([Type.Literal("load"), Type.Literal("restart"), Type.Literal("edit"), Type.Literal("select"), Type.Literal("mix"), Type.Literal("stop"), Type.Literal("status"), Type.Literal("leave")]),
+			deck: Type.Optional(Type.String({ description: "logical deck letter A..Z", pattern: "^[A-Z]$" })),
+			slot: Type.Optional(Type.Number({ description: "pair position for select: 0 = mix 0 side, 1 = mix 1 side; the deck holding that position is parked" })),
 			file: Type.Optional(Type.String()),
-			mix: Type.Optional(Type.Number({ description: "0=A, 1=B; both clocks continue" })),
+			mix: Type.Optional(Type.Number({ description: "0 = pair position 0, 1 = pair position 1; both clocks continue" })),
 			cycles: Type.Optional(Type.Number({ description: "Crossfade duration at the current tempo" })),
 		}),
 		async execute(_id, params, _signal, _update, ctx) {
 			const text = await sceneQueue(() => sceneController.action(params, ctx.cwd));
 			persistScenes();
-			return { content: [{ type: "text", text }], details: { decks: scenes.entries(), mix: scenes.mix } };
+			return { content: [{ type: "text", text }], details: { decks: scenes.entries(), mix: scenes.mix, pair: scenes.pair } };
 		},
 	});
 
@@ -1173,7 +1190,7 @@ export default async function (pi: ExtensionAPI) {
 			if (!isStackReady(status)) {
 				return { content: [{ type: "text", text: `tidal_panic: ${status}` }], details: {} };
 			}
-			if (sceneController.runtimeReady) await sceneQueue(() => sceneController.leave());
+			await leaveScenesForHush();
 			sendChunk("hush");                       // stop events on the Tidal side
 			let scOut = "(no sclang stdin)";
 			if (sclangProc?.stdin) {
@@ -1252,10 +1269,8 @@ export default async function (pi: ExtensionAPI) {
 			if (!isStackReady(status)) {
 				return { content: [{ type: "text", text: `tidal_eval failed: ${status}` }], details: {} };
 			}
-			if (sceneController.runtimeReady) {
-				if (params.code.trim() === "hush") await sceneQueue(() => sceneController.leave());
-				else throw new Error("Use tidal_scene while deck mode owns the orbits; leave scene mode before ad-hoc legacy evals");
-			}
+			if (params.code.trim() === "hush") await leaveScenesForHush();
+			else if (sceneController.runtimeReady) throw new Error("Use tidal_scene while deck mode owns the orbits; leave scene mode before ad-hoc legacy evals");
 			if (extractSc(params.code).sc.length || isSceneFile(params.code)) throw new Error("Use tidal_scene to load embedded SC scenes");
 			const scripted = params.code.match(/:script\s+(\S+\.tidal)/);
 			if (scripted) {
@@ -1284,7 +1299,7 @@ export default async function (pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const status = await ensureStack(ctx.cwd);
-			if (sceneController.runtimeReady) await sceneQueue(() => sceneController.leave());
+			await leaveScenesForHush();
 			if (sendChunk("hush")) {
 				lastLabel = "hush";
 				updateWidget("hush");
@@ -1329,12 +1344,13 @@ export default async function (pi: ExtensionAPI) {
 
 	// ---------- command ----------
 	pi.registerCommand("tidal", {
-		description: "tidal stack: /tidal status|hush|restart|scene load A file.tidal|scene mix 1 4|scene stop A|scene leave|record start|mark <label>",
+		description: "tidal stack: /tidal status|hush|restart|scene load A 159.tidal|scene select C 1|scene mix 1 4|scene stop A|scene leave|record start|mark <label>",
 		handler: async (args, ctx) => {
 			const arg = (args || "status").trim();
 			if (arg === "scene" || arg.startsWith("scene ")) {
 				const [, action = "status", ...rest] = arg.split(/\s+/);
 				const params = action === "mix" ? { action, mix: Number(rest[0]), cycles: rest[1] === undefined ? 0 : Number(rest[1]) }
+					: action === "select" ? { action, deck: rest[0], slot: rest[1] === undefined ? undefined : Number(rest[1]) }
 					: { action, deck: rest[0] ?? "A", file: rest.slice(1).join(" ") || undefined };
 				try { ctx.ui.notify(await sceneQueue(() => sceneController.action(params, ctx.cwd)), "info"); persistScenes(); }
 				catch (error) { ctx.ui.notify(`tidal scene: ${error}`, "error"); }
@@ -1364,7 +1380,7 @@ export default async function (pi: ExtensionAPI) {
 				return;
 			}
 			if (arg === "hush") {
-				if (sceneController.runtimeReady) await sceneQueue(() => sceneController.leave());
+				await leaveScenesForHush();
 				if (sendChunk("hush")) ctx.ui.notify("tidal: hush sent", "info");
 				else ctx.ui.notify("tidal: repl not ready", "error");
 				return;

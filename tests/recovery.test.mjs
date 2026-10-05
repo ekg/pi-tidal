@@ -121,3 +121,69 @@ test('extension imports and registers the livecoding tools without booting audio
     assert.equal(typeof tools.get(name)?.execute, 'function', name);
   }
 });
+
+test('all hush entry points persist their cleared scene state', () => {
+	// Contract check only: do not boot a real server to exercise emergency stop.
+	const source = fs.readFileSync(new URL('../extensions/tidal.ts', import.meta.url), 'utf8');
+	assert.match(source, /async function leaveScenesForHush\(\): Promise<void> \{\s*await sceneQueue\(\(\) => sceneController\.leave\(\)\);[\s\S]*?persistScenes\(\);\s*\}/);
+	assert.equal((source.match(/await leaveScenesForHush\(\)/g) ?? []).length, 4);
+});
+
+test('cold session recovery restores old A/B snapshots and new A-Z pairs', async () => {
+	const sceneText = (cps = 0.3) => `-- @scene {"cps":${cps}}\nd1 $ s "bd" # orbit 0\n`;
+	const entry = data => ({ type: "custom", customType: "tidal-scenes", data });
+	async function bootWithSnapshot(data, dir) {
+		const tools = new Map();
+		const events = new Map();
+		await extension({
+			registerTool: t => tools.set(t.name, t),
+			registerCommand() {},
+			on: (name, fn) => events.set(name, fn),
+		});
+		await events.get("session_start")({}, { hasUI: false, cwd: dir, sessionManager: { getBranch: () => [entry(data)] } });
+		const out = await tools.get("tidal_scene").execute("t", { action: "status" }, null, null, { cwd: dir });
+		return out.content[0].text;
+	}
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tidal-scene-recovery-"));
+	try {
+		// Old snapshot format (pre A-Z): no pair field, only A/B decks.
+		const legacy = {
+			decks: [
+				["A", { file: path.join(dir, "a.tidal"), text: sceneText() }],
+				["B", { file: path.join(dir, "b.tidal"), text: sceneText() }],
+			],
+			mix: 0.25,
+		};
+		const empty = await bootWithSnapshot({decks: [], mix: 0, pair: ['A', 'B']}, dir);
+		assert.match(empty, /none loaded/);
+		const oldText = await bootWithSnapshot(legacy, dir);
+		assert.match(oldText, /pair A \(mix 0\) \/ B \(mix 1\)/);
+		assert.match(oldText, /A: a\.tidal, epoch \d+/);
+		assert.match(oldText, /mix 0\.25/);
+		// New format: a non-default pair plus parked decks survive a cold start.
+		const modern = {
+			decks: [
+				["A", { file: path.join(dir, "a.tidal"), text: sceneText() }],
+				["C", { file: path.join(dir, "c.tidal"), text: sceneText() }],
+			],
+			mix: 0.75,
+			pair: ["A", "C"],
+		};
+		const newText = await bootWithSnapshot(modern, dir);
+		assert.match(newText, /pair A \(mix 0\) \/ C \(mix 1\)/);
+		assert.match(newText, /C: c\.tidal, epoch \d+/);
+		assert.match(newText, /mix 0\.75/);
+		// Restore the pair first, atomically. A/B can be parked at unrelated
+		// tempos, and B may occupy the zero side of a valid saved pair.
+		for (const pair of [['B', 'A'], ['B', 'C'], ['C', 'D']]) {
+			const decks = [...'ABCD'].map((deck, i) => [deck, {
+				file: path.join(dir, `${deck.toLowerCase()}.tidal`),
+				text: sceneText(pair.includes(deck) ? 0.3 : 0.4 + i * 0.1),
+			}]);
+			const text = await bootWithSnapshot({decks, pair, mix: 0.6}, dir);
+			assert.ok(text.includes(`pair ${pair[0]} (mix 0) / ${pair[1]} (mix 1):`));
+			assert.match(text, /mix 0\.6/);
+			for (const [deck] of decks) assert.ok(text.includes(`${deck}: ${deck.toLowerCase()}.tidal`));
+		}
+	} finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

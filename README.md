@@ -22,14 +22,18 @@ agent: edits .tidal chunk  →  save  →  chunk auto-evaluates  →  sound chan
 
 ## Scene decks
 
-Scene files combine local d1–d16 lanes with embedded SC modulation. Load/restart
-begins at local cycle zero; file saves preserve phase. A/B decks own independent
-routing and effects, share tempo, and crossfade without resetting the global
-clock. See [scene format, commands, ownership and validation](docs/scenes.md).
+Scene files combine local d1–d16 lanes with embedded SC modulation. Decks are
+named A–Z; two of them form the audible crossfade **pair** (default A/B) and
+own the twelve orbits between them, so up to 26 scenes can stay loaded while
+only two render. Load/restart begins at local cycle zero; file saves preserve
+phase; loading a letter outside the pair parks it until
+`/tidal scene select <deck> 0|1` swaps it into the pair (parking the deck it
+replaces). See [scene format, commands, ownership and validation](docs/scenes.md).
 
 ```
 /tidal scene load A 159.tidal
-/tidal scene load B 160.tidal
+/tidal scene load C 161.tidal
+/tidal scene select C 1
 /tidal scene mix 1 4
 /tidal scene leave
 ```
