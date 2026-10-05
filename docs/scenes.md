@@ -1,11 +1,11 @@
 # Scene decks: patterns and SC modulation in one `.tidal`
 
-Scene decks are named `A` through `Z`. Two of those letters form the
-**active pair** — the two decks that are actually rendered and crossfaded;
-the default pair is `A`/`B`. Every other loaded letter is *parked*: its source
-is validated and remembered, but it runs no patterns, no SC nodes and no DSP.
-The project has only 12 Dirt orbits (six per rendered pair position), so
-letters beyond the pair never allocate audio resources.
+Scene decks are named `A` through `Z`. **N channels** hold the rendered decks;
+**N defaults to 2**, the backward-compatible A/B **active pair**. Each channel
+owns K local orbits (**K defaults to 6**). Every other loaded letter is *parked*:
+its source is validated and remembered, but runs no patterns, SC nodes or DSP.
+Letters never allocate render chains: at most N decks render, however many are
+loaded. The default project needs 12 Dirt orbits, exactly as before.
 
 A scene opts in with a JSON header. SC is inside valid Haskell block comments:
 
@@ -52,8 +52,8 @@ position. Stopping a deck deletes its record but does not change the pair.
 
 `cycles` is converted to seconds at the current tempo when the fade starts.
 A tempo change during that fade does not change its duration. Fade starts when
-requested, not on a quantized bar. Both clocks of the current pair keep
-advancing while muted — reaching a mix endpoint never stops a clock, and a
+requested, not on a quantized bar. Both deck-local phases follow the global clock
+while muted — reaching a mix endpoint never stops a clock, and a
 muted deck keeps its orbits and effects until it is parked, stopped or left.
 
 ### Parked, muted, stopped
@@ -76,21 +76,128 @@ not beats. Start is at least one second ahead to accommodate look-ahead.
 
 Saving a loaded file auto-edits its deck(s) with phase preserved — audible
 decks stay audible, parked decks stay parked. Saving an inactive scene does
-**not** start it. Use explicit restart to reset the phase. Decks in the active
-pair must share one cps; tempo changes require an explicit scene restart, and
-you must stop the other pair deck first. A parked deck may keep a different
-cps, but it cannot be selected into the pair while the other audible deck
-runs at another tempo.
+**not** start it. Use explicit restart to reset the phase. Decks in active channels share ONE global clock and effective cps. Outside an
+explicit `morph`, changing declared cps requires a restart and stopping the other
+active decks first. A parked deck may keep a different declared cps, but cannot
+be selected while another active channel runs at an incompatible effective tempo.
+
+## N-channel configuration and faders
+
+Set `PI_TIDAL_SCENE_CHANNELS=2..26` and `PI_TIDAL_SCENE_ORBITS=1..16` before
+loading the extension; defaults are **2** and **6**. Channels initially hold
+A, B, C, ... up to N letters, even when unloaded. Initial power weights are
+`[1, 0, ...]`. Loading any assigned letter activates it; other letters park.
+`select` keeps its legacy `slot` parameter, now an integer `0..N-1`.
+
+With N=3, K=6 (requires 18 project orbits):
+
+```
+/tidal scene load C 161.tidal
+/tidal scene gain 2 0.25 2       # channel 2, power weight, seconds
+/tidal scene select Z 2         # requires a loaded Z; parks C
+```
+
+The tool uses `{action:"gain", channel:2, gain:0.25, seconds:2}`. Weights are
+0..1; actual mixer amplitude is **sqrt(weight)**, so 0.25 means half amplitude.
+Legacy `mix x cycles` still sets channels 0/1 to `[1-x, x]`, leaving other
+channels alone. This is precisely the existing equal-power crossfade, not a
+new fade law. Independent faders are not normalized; many open channels can
+clip the shared master. Muting never stops phase or frees resources.
+
+SC installs exactly N buses/mixers and N context slots. Its install signature
+is `install(token, channelCount=2, orbitsPerChannel=6)`; configuration arguments
+are appended, **not inserted before token**. `prepare(slot, epoch, restart,
+source, token, deck)` is unchanged: token remains argument five. Default A/B
+commands and snapshot shape stay unchanged. Old controller/new runtime and new
+controller/old runtime retain default A/B compatibility. Configurable channels
+and new faders need the new runtime; an old runtime is explicitly rejected for
+nondefault configuration. Leave scene mode and load the updated runtime, rather
+than restarting a live interpreter merely for a plugin reload.
+
+### Project startup proposal (not applied)
+
+The plugin cannot create extra Dirt orbits after startup. The installed
+SuperDirt constructor is **`SuperDirt(numChannels, server)`**, not
+`SuperDirt(numOrbits, numChannels)`: keep `SuperDirt(2, s)`. Its `start` output-bus
+list determines orbit count. In `/home/erik/livecode/superdirt_startup.scd`, the
+parent must expand today's `~dirt.start(57120, 0 ! 12)` output list to **N*K**
+entries, preserving the project's `0` bus convention. For 3 channels x 6 orbits,
+that means 18 entries. No project startup file was edited for this change.
+
+Plugin configuration and startup must agree; installation checks
+`~dirt.orbits.size >= N*K` and errors with the required count before routing.
+Extra existing orbits are not claimed; only the first N*K belong to scene mode.
+The default N=2,K=6 still requires the same 12-orbit output list. Each orbit adds
+its own global FX instances (`name ++ numChannels`, including dub delay/reverb/
+monitor); these are siblings of orbit groups, not reclaimed by group-free alone.
+More channels add buses, mixers and modulation plus **K more FX chains per
+channel**. Keep N modest; above 6 channels the extension emits a loud CPU warning.
+Changing these settings on an installed scene runtime requires leaving scene
+mode first. Changes to Dirt startup itself require a separately authorized
+project restart; do not attempt that during an ordinary scene action.
+
+## Tempo-riding transition
+
+```
+/tidal scene morph 0 1 0.4 8     # source, destination, target cps, wall seconds
+/tidal scene cancel
+```
+
+Tool: `{action:"morph", from:0, to:1, toCps:0.4, seconds:8, stepHz:4}`.
+Both channels must be loaded and distinct. CPS must be >0..4, duration >0..300
+seconds, and stepHz 1..10 (default 4). The action returns immediately; `status`
+reports running/completed/cancelled/failed. Starting another ride supersedes it.
+
+Tidal has **one clock**, and `setcps = once . cps` does **not** ramp. The controller
+samples `getcps` first, then schedules a bounded linear sequence of `setcps`
+steps over wall time, acknowledging each REPL write and SC gain request. From
+0.3 to 0.6 cps over 1 second at 4 Hz: 0.375, 0.45, 0.525, 0.6. Every rendered
+channel follows that tempo, including muted ones. No origin, setCycle, scene
+pattern or phase bus is reset. This is a deliberate global-tempo action, never
+a side effect of moving a normal fader.
+
+The source power weight falls from its current value to zero; destination rises
+from its current weight to one. Other channels retain their weights. For the
+standard `[1,0]` endpoints this is the same equal-power law as `mix`. SC smooths
+each target over 20ms. This is a stepped transition, not an independent,
+sample-accurate pair of clocks; an already-open destination need not conserve
+pair power throughout the ride.
+
+Each step and cancellation run on the same scene lifecycle queue. Only one
+timer exists at a time. `cancel`, mix/gain, load/edit/restart, select, stop,
+leave and transport reset invalidate the ride; queued stale callbacks do nothing.
+Cancel keeps the last acknowledged cps and gain **targets** (SC may still be
+settling to them), frees the timer and reports those targets. On mid-ride error,
+the controller attempts to restore both transports to those targets and reports
+failure. If rollback cannot be acknowledged, status explicitly says **transport
+state unconfirmed; recovery required**; stored targets remain the last good
+ones, not a false claim of audible state. Shutdown also cancels the scheduler.
+
+Look-ahead and repeated clock mutations can produce **Tidal scheduling jitter**
+(including events scheduled earlier in the normal stream), and transport latency
+can desynchronize gain/tempo changes. Rates are capped at 10 Hz and never burst
+to catch up: slow acknowledgements can extend the requested duration. The exact
+sequence is bounded by max(1, floor(seconds*stepHz)) steps. No audible smoothness
+or SC graph health has been proven by offline tests.
+
+A separate **effective tempo override** is persisted after a ride, including
+cancellation/failure; `.tidal` headers and source snapshots are never rewritten.
+Status distinguishes declared cps from effective cps. Unchanged edits/restarts
+with other active channels retain the override; newly loaded/selected source
+must match effective tempo. Recovery replays the override, not the old header
+tempo, from local zero; it does not resume a partially completed ride. A lone
+explicit load/restart may legitimately set its declared tempo and clear the
+override; `leave` clears it without changing the current Tidal tempo.
 
 ## Routing and ownership
 
-The **pair position** (mix 0 or mix 1) owns the orbits: position 0 owns
-physical orbits 0–5, position 1 owns 6–11. Which letter sits at a position
-changes with `select`; the six-orbit block itself never moves. Scene files
-always use **local** literal `# orbit 0` through `# orbit 5`; the plugin
-remaps them onto the owning position's physical orbits. Dynamic orbit
-expressions are rejected. Without an explicit orbit, d1–d5 use 0–4 and d6–d16
-share orbit 5. There are still 16 logical lanes *per file*, but the plugin stacks
+The **channel index** owns its fixed orbit block: physical orbit = channel*K
++ local orbit. By default position 0 owns 0–5, position 1 owns 6–11. Which letter
+sits there changes with `select`; the block never moves. Scene files always use
+**local** literal `# orbit 0` through `# orbit (K-1)` (write the actual integer,
+not an expression); the plugin remaps to physical orbits. Dynamic orbit
+expressions are rejected. Default d1–d5 use 0–4 and d6–d16 share orbit 5; with
+custom K, the default lane orbit is min(lane-1, K-1). There are still 16 logical lanes *per file*, but the plugin stacks
 these into independent named Tidal streams (`piScene<letter>`,
 `piSceneClock<letter>`) instead of letting one deck's d1
 replace the other's d1.
@@ -105,11 +212,11 @@ an orbit group cannot reclaim ungated effects. If an effect can auto-pause durin
 release, the project must also reclaim its retired nodes. The runtime calls an
 optional captured `~pruneDirtFX` project hook after rebuild/release grace.
 
-Scene mode claims all twelve orbits. Entering it hushes legacy streams once;
+Scene mode claims the first N*K orbits (twelve by default). Entering it hushes legacy streams once;
 parking alone does not — only audible decks claim the orbits, so legacy
 eval/edit still works while every loaded deck is parked. Legacy eval/edit and
 project-routing reload are blocked while scene mode is active. `leave` frees
-both pair slots and all parked records and restores the previous orbit routes;
+all channel slots and parked records and restores the previous orbit routes;
 it does not resume the earlier legacy music automatically.
 
 `stop` silences the deck's note/tick streams, frees sustained nodes and modulation,
@@ -153,9 +260,9 @@ bindings. Haskell continuations must be indented. Scene headers replace embedded
 ## Recovery and inspection
 
 Last successfully activated source snapshots — all loaded letters, the active
-pair and the mix position — are persisted on the active Pi session branch.
+channels, gain vector, effective tempo override and legacy pair/mix position — are persisted on the active Pi session branch.
 Stack/REPL recovery replays those snapshots—including SC—from local zero:
-the two pair decks restart audibly, parked decks are re-committed without
+the channel decks restart with their saved gains, parked decks are re-committed without
 allocating any runtime, and the mix position is restored. Snapshots written
 before the A–Z expansion (no pair field) still recover as the default A/B
 pair. The pair is restored atomically before checking deck tempos, so swapped
@@ -187,10 +294,12 @@ TIDAL_HASKELL_TESTS=1 node --test tests/repl-command.test.mjs
 
 The optional test invokes the installed Tidal library with **no audio boot**.
 It checks actual Haskell command sequencing for decks A, C and Z (both pair
-positions) and that rebased clock events begin at zero. Pure controller
+positions and a third channel with K=3), rebased clock events beginning at zero,
+and generated setcps steps against the installed Tidal types. Its tempo test
+never instantiates a Stream; `once` only queries patterns offline. Pure controller
 fixtures additionally cover 26 loaded/parked decks without 26 render chains,
-pair selection, routing isolation, select rollback, parked stops, shared
-tempo and recovery. For this project's twelve-orbit custom dub graph, run the
+pair/N-channel selection, K-block routing, select rollback, parked stops,
+shared effective tempo, ride sequence/cancellation/failure and snapshot recovery. For this project's twelve-orbit custom dub graph, run the
 read-only live check:
 
 ```supercollider
@@ -204,3 +313,5 @@ project's custom FX/master meter; it is not a generic stock-SuperDirt test.
 Pure controller fixtures cover edits, replacement, errors, routing,
 stop/leave, tempo conflicts, and replay. Live audio/CPU/cleanup checks remain
 necessary: mocked transport tests cannot establish that an SC graph is healthy.
+Fade continuity at channel handover (especially sustained nodes and FX tails),
+Tidal cps-step scheduling jitter and per-orbit FX CPU growth remain unverified.

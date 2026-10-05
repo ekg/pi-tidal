@@ -41,7 +41,12 @@ export default async function (pi: ExtensionAPI) {
 	const { createSceneRegistry, isSceneFile, extractSc, deckIndex, deckSlot, patternExpression, sceneCommands, stopCommands } = await importFreshModule(path.join(PACKAGE_DIR, "lib/scenes.mjs"));
 	const { tidalStatements } = await importFreshModule(path.join(PACKAGE_DIR, "lib/tidal-chunks.mjs"));
 	const { replCommand } = await importFreshModule(path.join(PACKAGE_DIR, "lib/repl-command.mjs"));
-	const scenes = createSceneRegistry();
+	const { tempoRideSteps } = await importFreshModule(path.join(PACKAGE_DIR, "lib/tempo-ride.mjs"));
+	const scenes = createSceneRegistry({
+		channelCount: Number(process.env.PI_TIDAL_SCENE_CHANNELS ?? 2),
+		orbitsPerChannel: Number(process.env.PI_TIDAL_SCENE_ORBITS ?? 6),
+	});
+	if (scenes.channelCount > 6) console.warn(`[pi-tidal] WARNING: ${scenes.channelCount} scene channels claim ${scenes.channelCount * scenes.orbitsPerChannel} orbits; each orbit adds global FX instances and CPU. Match project startup before use.`);
 	const sceneQueue = createLifecycleQueue();
 	const queryQueue = createLifecycleQueue();
 	const bootSignals = createBootSignals();
@@ -747,9 +752,7 @@ export default async function (pi: ExtensionAPI) {
 			try {
 				// Apply the audible pair before validating tempos: parked A/B may
 				// have different cps from each other and from the saved hot pair.
-				if (saved.data.pair !== undefined) scenes.restorePair(saved.data.pair);
-				for (const [deck, record] of saved.data.decks) scenes.commit(scenes.plan(deck, record.file, record.text, true));
-				scenes.setMix(saved.data.mix);
+				scenes.restoreSnapshot(saved.data);
 			} catch { scenes.clear(); }
 		}
 		// snapshot existing .tidal files so first edits diff cleanly
@@ -765,6 +768,7 @@ export default async function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (event) => {
 		closing = true;
+		await sceneQueue(() => sceneController.action({ action: "cancel" }, process.cwd()));
 		if (watchdog) { clearInterval(watchdog); watchdog = null; }
 		if (recActive) await stopRecording(false);
 		const reason = (event as { reason?: string } | undefined)?.reason;
@@ -840,11 +844,11 @@ export default async function (pi: ExtensionAPI) {
 		ensure: ensureStack, ready: isStackReady, writeRepl, queryRepl: replQuery,
 		sc: sceneSc, hush: () => sendChunk("hush"),
 		label: (text: string) => { lastLabel = text; updateWidget(); persistScenes(); },
-		deckIndex, deckSlot, patternExpression, sceneCommands, stopCommands,
+		deckIndex, deckSlot, patternExpression, sceneCommands, stopCommands, enqueue: sceneQueue, tempoRideSteps,
 	});
 
 	function persistScenes(): void {
-		pi.appendEntry?.("tidal-scenes", { decks: scenes.entries(), mix: scenes.mix, pair: scenes.pair });
+		pi.appendEntry?.("tidal-scenes", scenes.snapshot());
 	}
 
 	async function leaveScenesForHush(): Promise<void> {
@@ -857,23 +861,31 @@ export default async function (pi: ExtensionAPI) {
 		name: "tidal_scene", label: "Tidal Scene",
 		description:
 			"Load a .tidal scene with -- @scene metadata and {- @sc ... -} blocks onto a logical deck A..Z. " +
-			"Decks in the active crossfade pair (default A/B) are audible; loading any other letter parks it " +
-			"(source saved, Haskell checked, no DSP) until 'select' swaps it into a pair position, parking the deck it displaces. " +
+			"Decks in configured channels (default A/B pair) render; loading an unassigned letter parks it " +
+			"(source saved, Haskell checked, no DSP) until 'select' swaps it into a channel, parking the deck it displaces. " +
 			"Load/restart starts at local cycle zero on a future bar; edit preserves phase. Mix crossfades the two pair decks; " +
-			"stop frees owned nodes; leave restores legacy orbit routing. Pair decks share tempo. " +
+			"gain sets a channel power weight; morph {from,to,toCps,seconds,stepHz} rides the ONE global clock while crossfading two channels; cancel holds last acknowledged targets. " +
+			"Configurable channels default to the backward-compatible A/B pair; stop frees owned nodes; leave restores legacy orbit routing. Active channels share effective tempo. " +
 			"SC blocks use scene[\\mod].value({ |cycles| [toneHz, sat, wet, gain] }).",
 		parameters: Type.Object({
-			action: Type.Union([Type.Literal("load"), Type.Literal("restart"), Type.Literal("edit"), Type.Literal("select"), Type.Literal("mix"), Type.Literal("stop"), Type.Literal("status"), Type.Literal("leave")]),
+			action: Type.Union([Type.Literal("load"), Type.Literal("restart"), Type.Literal("edit"), Type.Literal("select"), Type.Literal("mix"), Type.Literal("gain"), Type.Literal("morph"), Type.Literal("cancel"), Type.Literal("stop"), Type.Literal("status"), Type.Literal("leave")]),
 			deck: Type.Optional(Type.String({ description: "logical deck letter A..Z", pattern: "^[A-Z]$" })),
-			slot: Type.Optional(Type.Number({ description: "pair position for select: 0 = mix 0 side, 1 = mix 1 side; the deck holding that position is parked" })),
+			slot: Type.Optional(Type.Number({ description: "channel index for select (default 0 or 1); the deck holding that channel is parked" })),
 			file: Type.Optional(Type.String()),
 			mix: Type.Optional(Type.Number({ description: "0 = pair position 0, 1 = pair position 1; both clocks continue" })),
 			cycles: Type.Optional(Type.Number({ description: "Crossfade duration at the current tempo" })),
+			channel: Type.Optional(Type.Number({ description: "Channel index for gain" })),
+			gain: Type.Optional(Type.Number({ description: "Power weight 0..1; amplitude is sqrt(gain)" })),
+			from: Type.Optional(Type.Number({ description: "Source channel index for morph" })),
+			to: Type.Optional(Type.Number({ description: "Destination channel index for morph" })),
+			toCps: Type.Optional(Type.Number({ description: "Explicit global tempo target >0..4 for morph" })),
+			seconds: Type.Optional(Type.Number({ description: "Wall-clock duration (morph >0..300, gain 0..300)" })),
+			stepHz: Type.Optional(Type.Number({ description: "Tempo writes/sec 1..10, default 4; look-ahead can jitter" })),
 		}),
 		async execute(_id, params, _signal, _update, ctx) {
 			const text = await sceneQueue(() => sceneController.action(params, ctx.cwd));
 			persistScenes();
-			return { content: [{ type: "text", text }], details: { decks: scenes.entries(), mix: scenes.mix, pair: scenes.pair } };
+			return { content: [{ type: "text", text }], details: scenes.snapshot() };
 		},
 	});
 
@@ -1344,12 +1356,14 @@ export default async function (pi: ExtensionAPI) {
 
 	// ---------- command ----------
 	pi.registerCommand("tidal", {
-		description: "tidal stack: /tidal status|hush|restart|scene load A 159.tidal|scene select C 1|scene mix 1 4|scene stop A|scene leave|record start|mark <label>",
+		description: "tidal stack: /tidal status|hush|restart|scene load A 159.tidal|scene select C 1|scene mix 1 4|scene gain 2 0.25 2|scene morph 0 1 0.4 8|scene cancel|scene stop A|scene leave|record start|mark <label>",
 		handler: async (args, ctx) => {
 			const arg = (args || "status").trim();
 			if (arg === "scene" || arg.startsWith("scene ")) {
 				const [, action = "status", ...rest] = arg.split(/\s+/);
 				const params = action === "mix" ? { action, mix: Number(rest[0]), cycles: rest[1] === undefined ? 0 : Number(rest[1]) }
+					: action === "gain" ? { action, channel: Number(rest[0]), gain: Number(rest[1]), seconds: rest[2] === undefined ? undefined : Number(rest[2]) }
+					: action === "morph" ? { action, from: Number(rest[0]), to: Number(rest[1]), toCps: Number(rest[2]), seconds: Number(rest[3]), stepHz: rest[4] === undefined ? undefined : Number(rest[4]) }
 					: action === "select" ? { action, deck: rest[0], slot: rest[1] === undefined ? undefined : Number(rest[1]) }
 					: { action, deck: rest[0] ?? "A", file: rest.slice(1).join(" ") || undefined };
 				try { ctx.ui.notify(await sceneQueue(() => sceneController.action(params, ctx.cwd)), "info"); persistScenes(); }

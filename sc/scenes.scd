@@ -1,5 +1,5 @@
-/* Two rendered scene slots, six orbits each; decks A..Z are logical and map
-   onto the slots through the active pair. Loaded on demand, never at boot.
+/* N rendered scene channels, K orbits each (defaults: 2 x 6); decks A..Z map
+   onto the channels, never allocate per-letter render chains. Loaded on demand, never at boot.
    Tick synths and note events share SuperDirt's timestamped server bundles.
    The phase bus is extrapolated between 1/16-cycle ticks, not a wall-clock LFO.
    Scene code is a trusted closure |scene|; use scene[\mod] and scene[\own].
@@ -10,7 +10,7 @@ var manager, releaseContext, makeContext, acknowledge, pruneRetired;
 pruneRetired = ~pruneDirtFX ? {};
 if(~piSceneAPI.notNil) { Error("scene runtime already installed").throw };
 manager = (installed: false, active: Array.newClear(2), pending: Array.newClear(2),
-    mixes: Array.newClear(2), buses: Array.newClear(2), mix: 0);
+    mixes: Array.newClear(2), buses: Array.newClear(2), mix: 0, channelCount: 2, orbitsPerChannel: 6, gains: [1, 0]);
 acknowledge = { |token, ok = true, error = ""|
     (token ++ if(ok) { ":ok" } { ":error:" ++ error }).postln;
 };
@@ -78,26 +78,37 @@ SynthDef(\piSceneMixer, { |inBus = 0, outBus = 0, controlBus = 0, mix = 0, fadeS
     Out.ar(outBus, signal * gain * level);
 }).add;
 ~piSceneAPI = (
-    install: { |token|
+    install: { |token, channelCount = 2, orbitsPerChannel = 6|
         Routine({
             try {
+                if(channelCount.inclusivelyBetween(2, 26).not or: { orbitsPerChannel.inclusivelyBetween(1, 16).not }) {
+                    Error("invalid scene channel/orbit configuration").throw;
+                };
+                if(manager[\installed] and: { manager[\channelCount] != channelCount or: { manager[\orbitsPerChannel] != orbitsPerChannel } }) {
+                    Error("leave scene mode before changing channel/orbit configuration").throw;
+                };
                 if(manager[\installed].not) {
-                    if(~dirt.orbits.size < 12) { Error("scene decks need 12 SuperDirt orbits").throw };
+                    if(~dirt.orbits.size < (channelCount * orbitsPerChannel)) {
+                        Error("scene mixer needs % SuperDirt orbits (% channels x % local orbits); update project startup".format(channelCount * orbitsPerChannel, channelCount, orbitsPerChannel)).throw;
+                    };
+                    manager[\channelCount] = channelCount; manager[\orbitsPerChannel] = orbitsPerChannel;
+                    [\active, \pending, \mixes, \buses].do { |key| manager[key] = Array.newClear(channelCount) };
+                    manager[\gains] = Array.fill(channelCount, { |slot| if(slot == 0) { 1 } { 0 } });
                     s.sync;
                     manager[\savedRoutes] = ~dirt.orbits.collect(_.outBus);
                     manager[\output] = if(~masterBus.notNil) { ~masterBus.index } { 0 };
                     manager[\group] = if(~masterBus.notNil) {
                         Group.before(Ndef(\dubMaster).group)
                     } { Group.tail(s.defaultGroup) };
-                    2.do { |slot|
+                    manager[\channelCount].do { |slot|
                         var initial = Bus.control(s, 4).setn([9500, 0.1, 0.08, 1]);
                         manager[\buses][slot] = Bus.audio(s, 2);
                         manager[("initial" ++ slot).asSymbol] = initial;
                         manager[\mixes][slot] = Synth.tail(manager[\group], \piSceneMixer,
                             [\inBus, manager[\buses][slot].index, \outBus, manager[\output],
-                             \controlBus, initial.index, \mix, 1 - slot]);
-                        6.do { |local|
-                            var orbit = ~dirt.orbits[slot * 6 + local];
+                             \controlBus, initial.index, \mix, manager[\gains][slot]]);
+                        manager[\orbitsPerChannel].do { |local|
+                            var orbit = ~dirt.orbits[slot * manager[\orbitsPerChannel] + local];
                             orbit.outBus = manager[\buses][slot];
                             orbit.freeSynths;
                         };
@@ -112,7 +123,7 @@ SynthDef(\piSceneMixer, { |inBus = 0, outBus = 0, controlBus = 0, mix = 0, fadeS
                         var duration = ~delta;
                         var latency = ~latency;
                         var active, pending, retiredPhase;
-                        if(slot.inclusivelyBetween(0, 1)) {
+                        if(slot.inclusivelyBetween(0, manager[\channelCount] - 1)) {
                             active = manager[\active][slot]; pending = manager[\pending][slot];
                             if(pending.notNil and: { pending[\epoch] == epoch }) {
                                 manager[\active][slot] = pending; manager[\pending][slot] = nil;
@@ -176,10 +187,26 @@ SynthDef(\piSceneMixer, { |inBus = 0, outBus = 0, controlBus = 0, mix = 0, fadeS
     },
     mix: { |position, seconds = 0.02|
         manager[\mix] = position.clip(0, 1);
+        manager[\gains][0] = 1 - manager[\mix]; manager[\gains][1] = manager[\mix];
         s.bind {
             manager[\mixes][0].set(\fadeSeconds, seconds, \mix, 1 - manager[\mix]);
             manager[\mixes][1].set(\fadeSeconds, seconds, \mix, manager[\mix]);
         };
+    },
+    // Values are power weights; the mixer applies sqrt, exactly as legacy mix.
+    gains: { |values, seconds = 0.02|
+        if(values.size != manager[\channelCount] or: { values.any { |gain| gain < 0 or: { gain > 1 } } }) {
+            Error("one power weight 0..1 is required per scene channel").throw;
+        };
+        s.bind {
+            values.do { |gain, slot|
+                // Do not shorten another channel's in-progress fader movement.
+                if(gain != manager[\gains][slot]) {
+                    manager[\mixes][slot].set(\fadeSeconds, seconds, \mix, gain);
+                };
+            };
+        };
+        manager[\gains] = values.copy;
     },
     cancel: { |slot|
         var pending = manager[\pending][slot], active = manager[\active][slot];
@@ -200,7 +227,7 @@ SynthDef(\piSceneMixer, { |inBus = 0, outBus = 0, controlBus = 0, mix = 0, fadeS
             SystemClock.sched(0.5, { pending[\phase].free; nil });
         };
         // True deck stop: free sustained sample/instrument nodes and FX tails.
-        6.do { |i| ~dirt.orbits[slot * 6 + i].freeSynths };
+        manager[\orbitsPerChannel].do { |i| ~dirt.orbits[slot * manager[\orbitsPerChannel] + i].freeSynths };
         SystemClock.sched(s.latency + 0.5, { pruneRetired.value; nil });
     },
     status: {
@@ -213,17 +240,17 @@ SynthDef(\piSceneMixer, { |inBus = 0, outBus = 0, controlBus = 0, mix = 0, fadeS
                 };
             } { "scene % inactive".format(name).postln };
         };
-        ("scene mix: " ++ manager[\mix]).postln;
+        ("scene mix: " ++ manager[\mix] ++ " gains: " ++ manager[\gains]).postln;
     },
     dispose: {
-        2.do { |slot| ~piSceneAPI[\stop].value(slot) };
+        manager[\channelCount].do { |slot| ~piSceneAPI[\stop].value(slot) };
         if(manager[\installed]) {
             ~dirt.orbits.do { |orbit, i| orbit.outBus = manager[\savedRoutes][i]; orbit.freeSynths };
             SystemClock.sched(s.latency + 0.5, { pruneRetired.value; nil });
             manager[\group].free;
             SystemClock.sched(0.5, {
                 manager[\buses].do(_.free);
-                2.do { |slot| manager[("initial" ++ slot).asSymbol].free };
+                manager[\channelCount].do { |slot| manager[("initial" ++ slot).asSymbol].free };
                 nil;
             });
         };

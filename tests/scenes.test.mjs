@@ -166,12 +166,15 @@ test('pair snapshots restore atomically without aliases or partial invalid updat
   }
 });
 
-test('SC runtime keeps two render slots and learns deck letters for status', () => {
+test('SC runtime defaults to two slots, allocates only N chains and requires N*K orbits', () => {
   const sc = fs.readFileSync(new URL('../sc/scenes.scd', import.meta.url), 'utf8');
-  // Resource model: exactly two rendered chains (12 orbits), never per-letter chains.
-  assert.match(sc, /Array\.newClear\(2\)/);
-  assert.match(sc, /2\.do \{ \|slot\|/);
-  assert.match(sc, /orbits\.size < 12/);
+  assert.match(sc, /channelCount: 2, orbitsPerChannel: 6/);
+  assert.match(sc, /Array\.newClear\(channelCount\)/);
+  assert.match(sc, /manager\[\\channelCount\]\.do \{ \|slot\|/);
+  assert.match(sc, /orbits\.size < \(channelCount \* orbitsPerChannel\)/);
+  assert.match(sc, /slot \* manager\[\\orbitsPerChannel\]/);
+  assert.match(sc, /install: \{ \|token, channelCount = 2, orbitsPerChannel = 6\|/);
+  assert.match(sc, /warp: \\lin\)\.sqrt/);
   assert.ok(!sc.includes('Array.newClear(26)'));
   // The runtime accepts a logical deck letter and reports it, not a raw slot.
   assert.match(sc, /prepare: \{ \|slot, epoch, restart, source, token, deck\|/);
