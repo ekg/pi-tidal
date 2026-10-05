@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import * as helpers from '../lib/scenes.mjs';
 import { createSceneController } from '../lib/scene-controller.mjs';
 import { createLifecycleQueue } from '../lib/lifecycle.mjs';
@@ -245,4 +248,32 @@ test('mixed-version default A/B works, but old SC faders reject morph before any
   assert.equal(f.timers.size, 0);
   await assert.rejects(f.action({ action: 'gain', channel: 0, gain: 0.2 }), /old SC scene runtime/);
   assert.deepEqual(f.registry.gains, [0.5, 0.5]);
+});
+
+test('scene mixer geometry is declared by the project, not guessed', async () => {
+  const { resolveSceneMixerConfig, DEFAULT_SCENE_MIXER, SCENE_MIXER_CONFIG_FILES } = await import('../lib/scene-mixer-config.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scene-mixer-config-'));
+  const read = file => fs.readFileSync(file, 'utf8');
+  try {
+    // Default keeps the historical 2 x 6 geometry.
+    assert.deepEqual(resolveSceneMixerConfig({ env: {}, cwd: dir, readFile: read }), { ...DEFAULT_SCENE_MIXER, source: 'default' });
+    // Environment wins.
+    assert.deepEqual(
+      resolveSceneMixerConfig({ env: { PI_TIDAL_SCENE_CHANNELS: '3', PI_TIDAL_SCENE_ORBITS: '4' }, cwd: dir, readFile: read }),
+      { channelCount: 3, orbitsPerChannel: 4, source: 'environment' });
+    // Project file next to the DSP layer.
+    fs.mkdirSync(path.join(dir, 'sc'), { recursive: true });
+    fs.writeFileSync(path.join(dir, SCENE_MIXER_CONFIG_FILES[0]), '{"channels":4,"orbits":6}\n');
+    assert.deepEqual(resolveSceneMixerConfig({ env: {}, cwd: dir, readFile: read }),
+      { channelCount: 4, orbitsPerChannel: 6, source: path.join(dir, SCENE_MIXER_CONFIG_FILES[0]) });
+    // The file's orbit count must equal what the startup gives SuperDirt.
+    fs.writeFileSync(path.join(dir, SCENE_MIXER_CONFIG_FILES[0]), '{"channels":4,"orbits":6}');
+    assert.equal(resolveSceneMixerConfig({ env: {}, cwd: dir, readFile: read }).channelCount * 6, 24);
+    // Invalid values fail loudly rather than silently mis-routing.
+    fs.writeFileSync(path.join(dir, SCENE_MIXER_CONFIG_FILES[0]), '{"channels":1}');
+    assert.throws(() => resolveSceneMixerConfig({ env: {}, cwd: dir, readFile: read }), /2\.\.26/);
+    fs.writeFileSync(path.join(dir, SCENE_MIXER_CONFIG_FILES[0]), 'not json');
+    assert.throws(() => resolveSceneMixerConfig({ env: {}, cwd: dir, readFile: read }), /is invalid/);
+    assert.throws(() => resolveSceneMixerConfig({ env: { PI_TIDAL_SCENE_CHANNELS: '31' }, cwd: dir, readFile: read }), /2\.\.26/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

@@ -39,13 +39,22 @@ export default async function (pi: ExtensionAPI) {
 	const { selectStereoSinkPorts } = await importFreshModule(path.join(PACKAGE_DIR, "lib/output-routing.mjs"));
 	const { createBootSignals, inspectBootLog, BOOT_TIMEOUT_MS, REPL_TIMEOUT_MS, ENSURE_TIMEOUT_MS, isStackReady } = await importFreshModule(path.join(PACKAGE_DIR, "lib/boot-readiness.mjs"));
 	const { createSceneRegistry, isSceneFile, extractSc, deckIndex, deckSlot, patternExpression, sceneCommands, stopCommands } = await importFreshModule(path.join(PACKAGE_DIR, "lib/scenes.mjs"));
+	const { resolveSceneMixerConfig, DEFAULT_SCENE_MIXER } = await importFreshModule(path.join(PACKAGE_DIR, "lib/scene-mixer-config.mjs"));
 	const { tidalStatements } = await importFreshModule(path.join(PACKAGE_DIR, "lib/tidal-chunks.mjs"));
 	const { replCommand } = await importFreshModule(path.join(PACKAGE_DIR, "lib/repl-command.mjs"));
 	const { tempoRideSteps } = await importFreshModule(path.join(PACKAGE_DIR, "lib/tempo-ride.mjs"));
+	const sceneMixer = (() => {
+		try { return resolveSceneMixerConfig(); }
+		catch (error) {
+			console.warn(`[pi-tidal] scene mixer config ignored: ${error instanceof Error ? error.message : error}; using ${DEFAULT_SCENE_MIXER.channelCount} x ${DEFAULT_SCENE_MIXER.orbitsPerChannel}`);
+			return { ...DEFAULT_SCENE_MIXER, source: 'default' };
+		}
+	})();
 	const scenes = createSceneRegistry({
-		channelCount: Number(process.env.PI_TIDAL_SCENE_CHANNELS ?? 2),
-		orbitsPerChannel: Number(process.env.PI_TIDAL_SCENE_ORBITS ?? 6),
+		channelCount: sceneMixer.channelCount,
+		orbitsPerChannel: sceneMixer.orbitsPerChannel,
 	});
+	dbg(`scene mixer ${scenes.channelCount} x ${scenes.orbitsPerChannel} orbits (from ${sceneMixer.source})`);
 	if (scenes.channelCount > 6) console.warn(`[pi-tidal] WARNING: ${scenes.channelCount} scene channels claim ${scenes.channelCount * scenes.orbitsPerChannel} orbits; each orbit adds global FX instances and CPU. Match project startup before use.`);
 	const sceneQueue = createLifecycleQueue();
 	const queryQueue = createLifecycleQueue();

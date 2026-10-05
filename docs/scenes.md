@@ -84,7 +84,17 @@ be selected while another active channel runs at an incompatible effective tempo
 ## N-channel configuration and faders
 
 Set `PI_TIDAL_SCENE_CHANNELS=2..26` and `PI_TIDAL_SCENE_ORBITS=1..16` before
-loading the extension; defaults are **2** and **6**. Channels initially hold
+loading the extension; defaults are **2** and **6**. A project can declare the
+same geometry in `sc/scene-mixer.json` (`{"channels":4,"orbits":6}`), which is
+read from the project directory when the environment is unset — that is the
+recommended way here, because the value must equal the orbit list SuperDirt is
+given at boot (`~dirt.start(57120, 0 ! (channels * orbits))`). The plugin
+refuses to install the mixer when the running server has fewer orbits than the
+configuration claims, instead of silently mis-routing notes past the end of the
+list. Extra orbits add per-orbit global FX (three synths each), so 4 x 6 = 24
+orbits is already 72 FX nodes.
+
+Channels initially hold
 A, B, C, ... up to N letters, even when unloaded. Initial power weights are
 `[1, 0, ...]`. Loading any assigned letter activates it; other letters park.
 `select` keeps its legacy `slot` parameter, now an integer `0..N-1`.
