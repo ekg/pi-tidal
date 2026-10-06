@@ -164,8 +164,18 @@ SynthDef(\piSceneMixer, { |inBus = 0, outBus = 0, controlBus = 0, mix = 0, fadeS
             var function, context, pending, old;
             try {
                 if(manager[\installed].not) { Error("scene runtime is not installed").throw };
-                function = ("{ |scene|\n" ++ source ++ "\n}").compile;
-                if(function.isNil) { Error("scene SC failed to compile").throw };
+                // SC 3.13 CHANGED String:compile: it now returns a THUNK that evaluates the
+                // string, so `(...).compile` hand back the closure WITHOUT RUNNING IT.
+                // `function.value(context)` then returned that closure as a value and the
+                // scene's SC block never executed - silently, with a SUCCESS acknowledgement,
+                // which made every scene[\mod] body inert (no error, no modulation).
+                // String:interpret evaluates the expression and yields the closure itself.
+                // Verified on SC 3.13.0: "{ |x| \"ran\".postln }".interpret.value(nil) runs it;
+                // the same string .compile.value(nil) returns a Function and runs nothing.
+                function = ("{ |scene|\n" ++ source ++ "\n}").interpret;
+                if(function.isNil or: { function.isKindOf(Function).not }) {
+                    Error("scene SC did not yield a function").throw
+                };
                 context = makeContext.value(slot, epoch, restart);
                 context[\deck] = deck; // logical deck letter, for status only
                 function.value(context);
