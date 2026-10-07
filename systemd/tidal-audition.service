@@ -1,0 +1,20 @@
+[Unit]
+Description=TidalCycles audition stack (headless sclang+scsynth+SuperDirt on 57111/57121)
+Documentation=file:%h/livecode/sc/audition/README.md
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+# The CLI starts detached sclang + ghci and returns, so track activation with a
+# oneshot: ExecStart boots the stack, ExecStop tears down only the PIDs it owns.
+# (If the stack later dies on its own, systemd does not supervise it; that is the
+# v0 trade-off for a CLI-driven stack. Restart=on-failure covers a failed boot.)
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=%h/pi-tidal/tools/audition/audition-ctl start
+ExecStop=%h/pi-tidal/tools/audition/audition-ctl stop
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

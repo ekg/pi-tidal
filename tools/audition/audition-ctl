@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# audition-ctl — boot/stop/inspect the second, headless audition stack.
+#
+# Verbs: start | stop | status | repl | run-job | submit | report | jobs | help
+#
+# The audition stack mirrors the live DSP graph (the real sc/init.scd) but runs
+# its own sclang + scsynth + SuperDirt on ports 57111 (scsynth) and 57121
+# (sclang/SuperDirt). It never touches the live stack: it never binds
+# 57110/57120, never writes live sc/boot.log, and stop signals ONLY the PIDs it
+# recorded (never pkill by process name).
+#
+# sclang's stdin is a FIFO (run/sclang.in), held open read-write by sclang
+# itself, so the job runner can submit SC one physical line at a time
+# (this.executeFile(...)) — the same idiom the live plugin uses. Without the
+# FIFO sclang would see EOF on stdin; the FIFO replaces the old `-D`.
+#
+# See /home/erik/livecode/sc/audition/README.md.
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Frozen values from docs/stream-audition.md; overridable by env.
+AUD_DIR="${PI_TIDAL_AUDITION_DIR:-/home/erik/livecode/sc/audition}"
+SCSYNTH_PORT="${PI_TIDAL_AUDITION_SCSYNTH_PORT:-57111}"
+SUPERDIRT_PORT="${PI_TIDAL_AUDITION_SUPERDIRT_PORT:-57121}"
+
+LIVE_SC="/home/erik/livecode/sc"
+MIRROR="$AUD_DIR/runtime/home/livecode/sc"
+CONFIG_DIR="$AUD_DIR/config"
+STARTUP="$AUD_DIR/audition-startup.scd"
+BOOT_HS="$AUD_DIR/BootTidal-audition.hs"
+REPL_CWD="/home/erik/livecode"
+PW_JACK="/usr/lib/x86_64-linux-gnu/pipewire-0.3/jack"
+
+RUN="$AUD_DIR/run"
+PIDFILE="$RUN/stack.pids"
+REPL_FIFO="$RUN/repl.in"
+SCLANG_FIFO="$RUN/sclang.in"
+REPL_OUT="$RUN/repl.out"
+SCLANG_LOG="$AUD_DIR/sclang.log"
+BOOT_LOG="$AUD_DIR/boot.log"
+READY="$AUD_DIR/ready"
+JOBS="$AUD_DIR/jobs"
+REPORTS="$AUD_DIR/reports"
+JOB_RUNNER="$HERE/job-runner.mjs"
+SCENE_RUNTIME="/home/erik/pi-tidal/sc/scenes.scd"
+MIXER_JSON="/home/erik/livecode/sc/scene-mixer.json"
+
+# Home-derived graph artifacts that MUST stay audition-private (real files, not
+# symlinks into the live tree). See classes/PlatformAuditionHome.sc.
+PRIVATE="boot.log master-meter.log spectrum.log state.scd ctl.log"
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'audition-ctl: %s\n' "$*" >&2; exit 1; }
+
+# --- port / process helpers -------------------------------------------------
+udp_listening() { # port
+  if command -v ss >/dev/null 2>&1; then
+    ss -Huln 2>/dev/null | awk '{print $4}' | grep -q ":$1\$"
+  else
+    grep -q "$(printf '%04X' "$1")" /proc/net/udp
+  fi
+}
+alive() { kill -0 "$1" 2>/dev/null; }
+tree_pids() { # pid -> this pid then every descendant, deepest last
+  local p="$1" c
+  echo "$p"
+  for c in $(pgrep -P "$p" 2>/dev/null || true); do tree_pids "$c"; done
+}
+read_pids() { # emit "role pid" lines from the pidfile
+  [ -f "$PIDFILE" ] || return 0
+  awk '$1=="sclang"||$1=="repl"{print $1, $2}' "$PIDFILE"
+}
+start_epoch() {
+  [ -f "$PIDFILE" ] || { echo 0; return; }
+  awk '$1=="start"{print $2}' "$PIDFILE"
+}
+
+# --- runtime layout ---------------------------------------------------------
+setup_runtime() {
+  mkdir -p "$RUN" "$CONFIG_DIR/SuperCollider" "$MIRROR" "$AUD_DIR/classes"
+  [ -f "$STARTUP" ] || die "missing $STARTUP"
+  [ -f "$BOOT_HS" ] || die "missing $BOOT_HS"
+  [ -f "$CONFIG_DIR/SuperCollider/startup.scd" ] || die "missing XDG startup.scd"
+  [ -f "$CONFIG_DIR/SuperCollider/sclang_conf.yaml" ] || die "missing XDG sclang_conf.yaml"
+  [ -f "$AUD_DIR/scsynth-log.sh" ] || die "missing audition scsynth-log.sh"
+
+  # Rebuild the mirror of sc/ as per-entry symlinks. The graph's home-derived
+  # writable artifacts stay private (created fresh by the graph); everything
+  # else is a symlink to the real file, so init.scd loads the true DSP code.
+  rm -rf "$MIRROR"
+  mkdir -p "$MIRROR"
+  local f b
+  for f in "$LIVE_SC"/*; do
+    b="$(basename "$f")"
+    [ "$b" = "audition" ] && continue
+    case " $PRIVATE " in *" $b "*) continue ;; esac
+    ln -sfn "$f" "$MIRROR/$b"
+  done
+  # init.scd writes <home>/livecode/sc/boot.log; land it at the contract path.
+  ln -sfn "$BOOT_LOG" "$MIRROR/boot.log"
+}
+
+# --- start ------------------------------------------------------------------
+do_start() {
+  local running; running="$(owned_roots_alive)"
+  if [ -n "$running" ]; then
+    say "audition stack already running (pids: $running)"
+    do_status
+    return 0
+  fi
+  setup_runtime
+  rm -f "$READY" "$PIDFILE"
+  rm -f "$REPL_FIFO"; mkfifo "$REPL_FIFO"
+  rm -f "$SCLANG_FIFO"; mkfifo "$SCLANG_FIFO"
+  local boot_before; boot_before="$(date +%s)"
+
+  say "booting audition scsynth on $SCSYNTH_PORT, SuperDirt on $SUPERDIRT_PORT ..."
+  local ldpath="$PW_JACK${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  # stdin is the sclang FIFO opened read-write (0<>), so sclang never sees EOF
+  # and the job runner can submit SC one physical line at a time. This replaces
+  # the old `-D` (no input thread): with the FIFO held open, sclang still runs
+  # headless without quitting on stdin.
+  # -u 57121 makes SuperDirt's OSC listener reuse sclang's own port.
+  env XDG_CONFIG_HOME="$CONFIG_DIR" LD_LIBRARY_PATH="$ldpath" \
+    nohup bash -c "exec 0<>'$SCLANG_FIFO'; exec sclang -u $SUPERDIRT_PORT" \
+    >"$SCLANG_LOG" 2>&1 </dev/null &
+  local sclang_pid=$!
+  say "sclang pid $sclang_pid (log $SCLANG_LOG)"
+
+  # Wait for scsynth + SuperDirt + a completed, FAIL-free graph log.
+  local deadline=$(( $(date +%s) + 180 )) ok=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if alive "$sclang_pid" \
+       && udp_listening "$SCSYNTH_PORT" && udp_listening "$SUPERDIRT_PORT" \
+       && [ -f "$READY" ]; then ok=1; break; fi
+    if ! alive "$sclang_pid"; then
+      say "sclang exited during boot; tail of $SCLANG_LOG:"; tail -n 20 "$SCLANG_LOG" >&2 || true
+      break
+    fi
+    sleep 1
+  done
+  if [ "$ok" -ne 1 ]; then
+    say "boot did not complete; stopping what was started"
+    kill_roots "$sclang_pid"
+    say "boot log ($BOOT_LOG):"; tail -n 25 "$BOOT_LOG" 2>/dev/null || true
+    die "audition stack failed to boot"
+  fi
+  say "graph installed (ready at $READY)"
+
+  # Background Tidal REPL (ghci), fed through a FIFO so run-job/status can reach
+  # it. Opening the FIFO read-write (0<>) keeps ghci from seeing EOF.
+  cd "$REPL_CWD"
+  nohup bash -c "exec 0<>'$REPL_FIFO' 1>'$REPL_OUT' 2>&1; exec ghci -ghci-script '$BOOT_HS'" \
+    >/dev/null 2>&1 </dev/null &
+  local repl_pid=$!
+  cd "$HERE"
+  say "repl pid $repl_pid (log $REPL_OUT)"
+
+  local rdeadline=$(( $(date +%s) + 90 ))
+  while [ "$(date +%s)" -lt "$rdeadline" ]; do
+    if ! alive "$repl_pid"; then say "repl exited early"; break; fi
+    if grep -qE "Connected to SuperDirt|Listening for external controls" "$REPL_OUT" 2>/dev/null; then break; fi
+    sleep 1
+  done
+
+  { echo "start $boot_before"; echo "sclang $sclang_pid"; echo "repl $repl_pid"; } > "$PIDFILE"
+  say "started"
+  do_status
+}
+
+# --- stop -------------------------------------------------------------------
+kill_roots() {
+  local roots=("$@") p
+  local pids=()
+  for p in "${roots[@]}"; do
+    [ -n "$p" ] || continue
+    while read -r q; do pids+=("$q"); done < <(tree_pids "$p")
+  done
+  # children first
+  local i
+  for (( i=${#pids[@]}-1; i>=0; i-- )); do kill -TERM "${pids[$i]}" 2>/dev/null || true; done
+  local end=$(( $(date +%s) + 8 ))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    local any=0
+    for p in "${pids[@]}"; do alive "$p" && any=1; done
+    [ "$any" -eq 0 ] && return 0
+    sleep 0.25
+  done
+  for (( i=${#pids[@]}-1; i>=0; i-- )); do kill -KILL "${pids[$i]}" 2>/dev/null || true; done
+  sleep 0.5
+}
+
+owned_roots_alive() {
+  local out="" role pid
+  while read -r role pid; do
+    [ -n "${pid:-}" ] || continue
+    if alive "$pid"; then out="${out:+$out }$role:$pid"; fi
+  done < <(read_pids)
+  printf '%s' "$out"
+}
+
+do_stop() {
+  if [ ! -f "$PIDFILE" ]; then
+    say "no pidfile; nothing owned to stop"
+    return 0
+  fi
+  local roots=() role pid
+  while read -r role pid; do [ -n "${pid:-}" ] && roots+=("$pid"); done < <(read_pids)
+  say "stopping owned pids: ${roots[*]:-none}"
+  if [ "${#roots[@]}" -gt 0 ]; then kill_roots "${roots[@]}"; fi
+  rm -f "$PIDFILE" "$READY" "$REPL_FIFO" "$SCLANG_FIFO"
+  say "stopped"
+}
+
+# --- status -----------------------------------------------------------------
+graph_ok() {
+  [ -f "$BOOT_LOG" ] || { echo "fail"; return; }
+  [ -f "$READY" ] || { echo "fail"; return; }
+  local se; se="$(start_epoch)"
+  if [ "${se:-0}" != "0" ]; then
+    local mt; mt="$(stat -c %Y "$BOOT_LOG" 2>/dev/null || echo 0)"
+    [ "$mt" -ge "$se" ] || { echo "fail"; return; }
+  fi
+  if grep -q "FAIL" "$BOOT_LOG"; then echo "fail"; return; fi
+  if grep -q "done" "$BOOT_LOG"; then echo "ok"; else echo "fail"; fi
+}
+
+repl_ready() {
+  local role pid rp=""
+  while read -r role pid; do
+    [ "$role" = "repl" ] && rp="$pid"
+  done < <(read_pids)
+  { [ -n "$rp" ] && alive "$rp" \
+      && grep -qE "Connected to SuperDirt|Listening for external controls" "$REPL_OUT" 2>/dev/null; } \
+    && echo "ready" || echo "down"
+}
+
+do_status() {
+  local sc="down" sd="down"
+  udp_listening "$SCSYNTH_PORT" && sc="up"
+  udp_listening "$SUPERDIRT_PORT" && sd="up"
+  say "scsynth: $sc ($SCSYNTH_PORT)"
+  say "superdirt: $sd ($SUPERDIRT_PORT)"
+  say "graph: $(graph_ok)"
+  say "repl: $(repl_ready)"
+  local owned="" role pid
+  while read -r role pid; do
+    [ -n "${pid:-}" ] || continue
+    alive "$pid" && owned="${owned:+$owned }$role:$pid"
+  done < <(read_pids)
+  say "owned pids: ${owned:-none}"
+}
+
+# --- repl / run-job ---------------------------------------------------------
+do_repl() {
+  say "opening audition Tidal REPL (Ctrl-D to leave; the stack keeps running)"
+  cd "$REPL_CWD"
+  exec ghci -ghci-script "$BOOT_HS"
+}
+
+do_run_job() {
+  local file="${1:-}"
+  [ -n "$file" ] || die "usage: audition-ctl run-job <file.tidal>"
+  [ -f "$file" ] || die "no such file: $file"
+  [ -p "$REPL_FIFO" ] || die "no running audition REPL (run 'audition-ctl start')"
+  { cat "$file"; printf '\n'; } > "$REPL_FIFO"
+  say "sent $file to audition REPL"
+}
+
+# --- jobs: submit / report / jobs -------------------------------------------
+# Scene geometry matches the live scene mixer (sc/scene-mixer.json -> 4 x 6);
+# the runner remaps a scene's LOCAL orbit N to the physical slot*orbits + N.
+mixer_channels() {
+  local v
+  v="$(sed -n 's/.*"channels"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$MIXER_JSON" 2>/dev/null | head -1)"
+  printf '%s' "${v:-2}"
+}
+mixer_orbits() {
+  local v
+  v="$(sed -n 's/.*"orbits"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$MIXER_JSON" 2>/dev/null | head -1)"
+  printf '%s' "${v:-6}"
+}
+scene_cps() { # <scene.tidal> -> declared cps or empty
+  grep -m1 -E '^[[:space:]]*--[[:space:]]*@scene' "$1" 2>/dev/null \
+    | sed -n 's/.*"cps"[[:space:]]*:[[:space:]]*\([0-9][0-9.eE+-]*\).*/\1/p'
+}
+job_field() { # <jsonfile> <key> -> string value or empty
+  sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -1
+}
+job_number() { # <jsonfile> <key> -> numeric value or empty
+  sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p" "$1" | head -1
+}
+job_state() { # report state (terminal) else job state else running
+  local id="$1"
+  if [ -f "$REPORTS/$id.json" ]; then
+    local s; s="$(job_field "$REPORTS/$id.json" state)"; printf '%s' "${s:-done}"; return
+  fi
+  local j; j="$(job_field "$JOBS/$id.json" state)"; printf '%s' "${j:-running}"
+}
+
+do_submit() {
+  local scene="" slot=0 cps="" cycles=8 withlive=false
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --slot)   slot="${2:?--slot needs a value}"; shift 2 ;;
+      --cps)    cps="${2:?--cps needs a value}"; shift 2 ;;
+      --cycles) cycles="${2:?--cycles needs a value}"; shift 2 ;;
+      --with-live) withlive=true; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) [ -z "$scene" ] || die "only one scene file is allowed"; scene="$1"; shift ;;
+    esac
+  done
+  [ -n "$scene" ] || die "usage: audition-ctl submit <scene.tidal> [--slot N] [--cps X] [--cycles N] [--with-live]"
+  [ -f "$scene" ] || die "no such scene: $scene"
+  scene="$(cd "$(dirname "$scene")" && pwd)/$(basename "$scene")"
+  case "$slot" in ''|*[!0-9]*) die "--slot must be a non-negative integer" ;; esac
+  case "$cycles" in ''|*[!0-9]*) die "--cycles must be a positive integer" ;; esac
+  [ "$cycles" -gt 0 ] || die "--cycles must be > 0"
+  [ -n "$cps" ] || cps="$(scene_cps "$scene")"
+  [ -n "$cps" ] || die "no cps: scene has no -- @scene cps and --cps was not given"
+  local channels; channels="$(mixer_channels)"
+  [ "$slot" -lt "$channels" ] || die "--slot $slot is outside the configured $channels scene channels"
+
+  mkdir -p "$JOBS" "$REPORTS" "$RUN"
+  local id createdms
+  id="$(date -u +%Y%m%dT%H%M%SZ)-$(printf '%04x' "$RANDOM")"
+  createdms="$(date +%s%3N)"
+  printf '{ "id": "%s", "createdMs": %s, "scene": "%s", "cps": %s, "slot": %s, "renderCycles": %s, "withLive": %s, "state": "queued" }\n' \
+    "$id" "$createdms" "$scene" "$cps" "$slot" "$cycles" "$withlive" > "$JOBS/$id.json"
+
+  local nodebin="${NODE_BIN:-$(command -v node || true)}"
+  [ -n "$nodebin" ] || die "node not found (set NODE_BIN)"
+  local orbits; orbits="$(mixer_orbits)"
+  local runner_env=(env \
+    PI_TIDAL_AUDITION_DIR="$AUD_DIR" \
+    PI_TIDAL_AUDITION_SCSYNTH_PORT="$SCSYNTH_PORT" \
+    PI_TIDAL_AUDITION_SUPERDIRT_PORT="$SUPERDIRT_PORT" \
+    PI_TIDAL_AUDITION_REPL_FIFO="$REPL_FIFO" \
+    PI_TIDAL_AUDITION_SCLANG_FIFO="$SCLANG_FIFO" \
+    PI_TIDAL_AUDITION_REPL_OUT="$REPL_OUT" \
+    PI_TIDAL_AUDITION_SCENE_RUNTIME="$SCENE_RUNTIME" \
+    PI_TIDAL_AUDITION_CHANNELS="$channels" \
+    PI_TIDAL_AUDITION_ORBITS="$orbits")
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "${runner_env[@]}" nohup "$nodebin" "$JOB_RUNNER" "$id" >"$RUN/job-$id.log" 2>&1 </dev/null &
+  else
+    "${runner_env[@]}" nohup "$nodebin" "$JOB_RUNNER" "$id" >"$RUN/job-$id.log" 2>&1 </dev/null &
+  fi
+  say "$id"
+}
+
+do_report() {
+  local id="${1:-}"
+  [ -n "$id" ] || die "usage: audition-ctl report <id>"
+  [ -f "$JOBS/$id.json" ] || die "unknown job: $id"
+  if [ -f "$REPORTS/$id.json" ]; then
+    local s; s="$(job_field "$REPORTS/$id.json" state)"
+    if [ -z "$s" ] || [ "$s" = "running" ] || [ "$s" = "queued" ]; then
+      printf '{"ok":false,"state":"running"}\n'; exit 3
+    fi
+    cat "$REPORTS/$id.json"; exit 0
+  fi
+  printf '{"ok":false,"state":"running"}\n'
+  exit 3
+}
+
+do_jobs() {
+  local limit=50
+  if [ "${1:-}" = "--limit" ]; then limit="${2:?--limit needs a value}"; shift 2; fi
+  case "$limit" in ''|*[!0-9]*) die "--limit must be a positive integer" ;; esac
+  [ -d "$JOBS" ] || return 0
+  local f id state scene createdms iso
+  while read -r f; do
+    [ -n "$f" ] || continue
+    id="$(basename "$f" .json)"
+    state="$(job_state "$id")"
+    scene="$(job_field "$f" scene)"
+    createdms="$(job_number "$f" createdMs)"
+    iso="$(date -u -d "@$(( ${createdms:-0} / 1000 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+    printf '%s %s %s %s\n' "$id" "$state" "$iso" "$scene"
+  done < <(ls -1 "$JOBS"/*.json 2>/dev/null | sort -r | head -n "$limit")
+}
+
+usage() {
+  cat <<EOF
+usage: audition-ctl <verb>
+
+  start     boot scsynth ($SCSYNTH_PORT) + SuperDirt ($SUPERDIRT_PORT) + Tidal REPL
+  stop      terminate only the PIDs this CLI recorded
+  status    print scsynth/superdirt/graph/repl state and owned pids
+  repl      open a foreground Tidal REPL against the running audition stack
+  run-job   send a .tidal file to the background REPL (run-job <file.tidal>)
+  submit    submit <scene.tidal> [--slot N] [--cps X] [--cycles N] [--with-live]
+            -> prints the job id; renders on the audition stack
+  report    report <id>  -> print the report JSON (exit 3 while rendering)
+  jobs      jobs [--limit N] -> '<id> <state> <createdISO> <scene>' lines
+  help      this message
+
+env overrides: PI_TIDAL_AUDITION_DIR, PI_TIDAL_AUDITION_SCSYNTH_PORT,
+               PI_TIDAL_AUDITION_SUPERDIRT_PORT, NODE_BIN
+EOF
+}
+
+case "${1:-help}" in
+  start)   do_start ;;
+  stop)    do_stop ;;
+  status)  do_status ;;
+  repl)    do_repl ;;
+  run-job) shift; do_run_job "$@" ;;
+  submit)  shift; do_submit "$@" ;;
+  report)  shift; do_report "$@" ;;
+  jobs)    shift; do_jobs "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
