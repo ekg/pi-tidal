@@ -18,10 +18,19 @@ import { Type } from "typebox";
 
 const PW_JACK = "/usr/lib/x86_64-linux-gnu/pipewire-0.3/jack";
 const PACKAGE_DIR = fileURLToPath(new URL("..", import.meta.url)); // .../pi-tidal/
+const STREAM_CTL = path.join(PACKAGE_DIR, "tools/stream/stream-ctl");
+const AUDITION_CTL = path.join(PACKAGE_DIR, "tools/audition/audition-ctl");
 const SCSYNTH_PORT = 57110;
 const SUPERDIRT_PORT = 57120;
 const DEBUG = !!process.env.TIDAL_EXT_DEBUG;
 function dbg(...args: unknown[]) { if (DEBUG) console.error("[tidal-ext]", ...args); }
+
+// Run a control CLI and keep its exit status: the audition `report` verb uses
+// exit 3 for "still running", so a non-zero exit is data, not necessarily a throw.
+function runCtl(bin: string, args: string[]): { stdout: string; stderr: string; code: number } {
+	const res = cp.spawnSync(bin, args, { encoding: "utf8", timeout: 330_000, maxBuffer: 8 * 1024 * 1024 });
+	return { stdout: res.stdout ?? "", stderr: res.stderr ?? "", code: res.status ?? (res.error ? 127 : 1) };
+}
 
 // Pi/Jiti reloads this entry point but can retain native helper exports. Load
 // the tiny bootstrap through Node itself; it uses content-addressed native ESM
@@ -36,7 +45,9 @@ export default async function (pi: ExtensionAPI) {
 	const { createLifecycleQueue } = await importFreshModule(path.join(PACKAGE_DIR, "lib/lifecycle.mjs"));
 	const { formatScStatus } = await importFreshModule(path.join(PACKAGE_DIR, "lib/sc-status.mjs"));
 	const { cleanReplError } = await importFreshModule(path.join(PACKAGE_DIR, "lib/repl-error.mjs"));
-	const { selectStereoSinkPorts } = await importFreshModule(path.join(PACKAGE_DIR, "lib/output-routing.mjs"));
+	const { planOutputLinks } = await importFreshModule(path.join(PACKAGE_DIR, "lib/output-routing.mjs"));
+	const { buildStreamArgs, parseStreamStatus, parseStreamUrl } = await importFreshModule(path.join(PACKAGE_DIR, "lib/stream-tools.mjs"));
+	const { buildAuditionArgs, parseAuditionSubmitId, parseAuditionReport, parseAuditionJobs, parseAuditionStatus, parseSpectrumReport, parseOrbitScanReport, buildLiveReport, liveSnapshotPath, isAuditionStillRunning } = await importFreshModule(path.join(PACKAGE_DIR, "lib/audition-tools.mjs"));
 	const { createBootSignals, inspectBootLog, BOOT_TIMEOUT_MS, REPL_TIMEOUT_MS, ENSURE_TIMEOUT_MS, isStackReady } = await importFreshModule(path.join(PACKAGE_DIR, "lib/boot-readiness.mjs"));
 	const { createSceneRegistry, isSceneFile, extractSc, deckIndex, deckSlot, patternExpression, sceneCommands, stopCommands } = await importFreshModule(path.join(PACKAGE_DIR, "lib/scenes.mjs"));
 	const { resolveSceneMixerConfig, DEFAULT_SCENE_MIXER } = await importFreshModule(path.join(PACKAGE_DIR, "lib/scene-mixer-config.mjs"));
@@ -59,6 +70,16 @@ export default async function (pi: ExtensionAPI) {
 	const sceneQueue = createLifecycleQueue();
 	const queryQueue = createLifecycleQueue();
 	const bootSignals = createBootSignals();
+
+	// Opt-in stream link config. stream-ctl reads the same file; missing/unreadable
+	// is the normal "gate off" case, never fatal.
+	function readStreamLinkConfig(): { link?: boolean } {
+		try {
+			const dir = process.env.PI_TIDAL_STREAM_CONFIG_DIR || path.join(process.env.HOME || "", ".config/tidal-stream");
+			const file = process.env.PI_TIDAL_STREAM_CONFIG || path.join(dir, "config.json");
+			return JSON.parse(fs.readFileSync(file, "utf8"));
+		} catch { return {}; }
+	}
 	let bootLogBefore = 0;
 	let bootStage = "idle";
 	let scOutputBuffer = "";
@@ -266,10 +287,22 @@ export default async function (pi: ExtensionAPI) {
 				let defaultSink = "";
 				try { defaultSink = cp.execFileSync("wpctl", ["inspect", "@DEFAULT_AUDIO_SINK@"], { encoding: "utf8" }); }
 				catch { /* no wpctl/default; fall back to the first complete pair */ }
-				const targets = selectStereoSinkPorts(ports, defaultSink);
-				if (targets) {
+				const plan = planOutputLinks({ pwLinkInputs: ports, defaultSink, config: readStreamLinkConfig(), env: process.env });
+				if (plan.physical) {
 					for (const [i, channel] of [[1, "FL"], [2, "FR"]] as const) {
-						try { cp.execFileSync("pw-link", [`SuperCollider:out_${i}`, targets[channel]], { stdio: "ignore" }); }
+						try { cp.execFileSync("pw-link", [`SuperCollider:out_${i}`, plan.physical[channel]], { stdio: "ignore" }); }
+						catch { /* already linked */ }
+					}
+				}
+				// Opt-in (default off): ALSO link scsynth's outs to the tidal_stream sink,
+				// additive on top of the physical link above. Never removes a link, never
+				// targets a capture port (selectStreamLinkPorts only matches playback_FL/FR),
+				// and does nothing when the sink node is absent. Gate: config link:true or
+				// PI_TIDAL_STREAM_LINK=1; with the gate off plan.stream is null and this
+				// block does not run.
+				if (plan.stream) {
+					for (const [i, channel] of [[1, "FL"], [2, "FR"]] as const) {
+						try { cp.execFileSync("pw-link", [`SuperCollider:out_${i}`, plan.stream[channel]], { stdio: "ignore" }); }
 						catch { /* already linked */ }
 					}
 				}
@@ -1360,6 +1393,131 @@ export default async function (pi: ExtensionAPI) {
 				parts.push("sclang tail:\n" + sclangTail.slice(-8).join("\n"));
 			}
 			return { content: [{ type: "text", text: parts.join("\n") }], details: {} };
+		},
+	});
+
+	// ---------- stream / audition tools ----------
+	// snapshotLive: read the LIVE stack's deck scan and write sc/audition/reports/
+	// live.json (lane 3 reads it for diffVsLive). Metering only — ~deckScanStart
+	// adds read-only meter synths and ~orbitScanStop removes them, so the live mix
+	// is never touched. Never boots a stack: an absent/silent sclang fails soft.
+	async function snapshotLiveStack(): Promise<string> {
+		if (!sclangProc?.stdin || !weSpawnedSclang) {
+			return "live stack is not running under this plugin (no sclang stdin); live.json not written. Start the stack, then retry.";
+		}
+		const sc = await queryScsynth(1500);
+		if (!sc.alive) return "live scsynth is down; live.json not written. Start the stack, then retry.";
+		// 6-band master + channel shares come from ~spectrumStart/~spectrumReport —
+		// the same bands the audition report uses, so diffVsLive is comparable. The
+		// deck scan is used only for per-channel dominant frequency.
+		try { scTransport.send("~spectrumStart.value; ~deckScanStart.value;", "[tidal_audition snapshotLive]"); }
+		catch (e) { return `snapshotLive: could not reach live sclang: ${e}`; }
+		await new Promise((r) => setTimeout(r, 2500)); // follower meters need a beat to build
+		const mark = sclangSeq;
+		try { scTransport.send("~spectrumReport.value; ~orbitScanReport.value;", "[tidal_audition snapshotLive]"); }
+		catch { /* fall through and report the empty scan gracefully */ }
+		await new Promise((r) => setTimeout(r, 1500));
+		const raw = sclangLinesSince(mark).join("\n").trim();
+		try { scTransport.send("~spectrumStop.value; ~orbitScanStop.value;", "[tidal_audition snapshotLive]"); } catch { /* best effort */ }
+		const spectrum = parseSpectrumReport(raw);
+		const orbit = parseOrbitScanReport(raw);
+		const report = buildLiveReport({ spectrum, orbit, raw });
+		if (!report.ok) {
+			return `snapshotLive: the live spectrum meter returned no readings; live.json not written (is the DSP graph with ~spectrumStart loaded?).\n${raw || "(no sclang output)"}`;
+		}
+		const outPath = liveSnapshotPath();
+		try {
+			fs.mkdirSync(path.dirname(outPath), { recursive: true });
+			fs.writeFileSync(outPath, JSON.stringify(report, null, 2) + "\n");
+		} catch (e) { return `snapshotLive: scan ok but could not write ${outPath}: ${e}`; }
+		lastLabel = "tidal_audition snapshotLive";
+		updateWidget("snapshot live");
+		return `live.json written: ${outPath} (${decks.length} channel(s): ${decks.map((d: any) => d.name).join(", ")})`;
+	}
+
+	pi.registerTool({
+		name: "tidal_stream",
+		label: "Tidal Stream",
+		description:
+			"Control the low-latency audio stream (the `tidal_stream` tap + streamd daemon). " +
+			"start/stop/enable/disable act on the systemd units; status prints the six parseable lines " +
+			"(sink, source linked, listeners, frames/sec, dropped, source up|down); url prints the WS URL " +
+			"and the tailnet hostname when the box is in a Tailscale tailnet. The stream is independent " +
+			"of the Tidal REPL and never needed to make sound.",
+		parameters: Type.Object({
+			action: Type.Union([
+				Type.Literal("start"), Type.Literal("stop"), Type.Literal("status"),
+				Type.Literal("url"), Type.Literal("enable"), Type.Literal("disable"),
+			], { description: "stream-ctl verb to run" }),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			const res = runCtl(STREAM_CTL, buildStreamArgs(params.action));
+			const raw = res.stdout.trim();
+			if (params.action === "status") {
+				const parsed = parseStreamStatus(res.stdout);
+				const summary = `source: ${parsed.source ?? "?"} | sink: ${parsed.sink ?? "?"} | source linked: ${parsed.sourceLinked === null ? "?" : parsed.sourceLinked ? "yes" : "no"} | listeners: ${parsed.listeners ?? 0} | frames/sec: ${parsed.framesPerSec ?? 0} | dropped: ${parsed.dropped ?? 0}`;
+				return { content: [{ type: "text", text: `${summary}\n\n${raw || res.stderr.trim() || "(no output)"}` }], details: parsed };
+			}
+			if (params.action === "url") {
+				return { content: [{ type: "text", text: raw || res.stderr.trim() || "(no url output)" }], details: parseStreamUrl(res.stdout) };
+			}
+			if (res.code !== 0) {
+				return { content: [{ type: "text", text: `stream ${params.action} failed (exit ${res.code}):\n${(res.stderr || res.stdout).trim() || "(no output)"}` }], details: { code: res.code } };
+			}
+			return { content: [{ type: "text", text: raw || `stream ${params.action}: ok` }], details: {} };
+		},
+	});
+
+	pi.registerTool({
+		name: "tidal_audition",
+		label: "Tidal Audition",
+		description:
+			"Drive the headless audition stack (a mirror of the live DSP graph on scsynth 57111 / SuperDirt 57121). " +
+			"start/stop/status manage the stack; submit stages a candidate scene and returns a job id; report polls it " +
+			"(returns the raw report JSON, or 'still running' while it renders); jobs lists recent jobs. snapshotLive " +
+			"scans the LIVE stack and writes sc/audition/reports/live.json for report diffVsLive — it never boots or " +
+			"disturbs the live stack and fails soft when it is down. Nothing here is required to keep playing.",
+		parameters: Type.Object({
+			action: Type.Union([
+				Type.Literal("start"), Type.Literal("stop"), Type.Literal("status"),
+				Type.Literal("submit"), Type.Literal("report"), Type.Literal("jobs"), Type.Literal("snapshotLive"),
+			], { description: "audition action" }),
+			scene: Type.Optional(Type.String({ description: "path to the .tidal scene to submit" })),
+			slot: Type.Optional(Type.Number({ description: "scene channel slot for submit" })),
+			cps: Type.Optional(Type.Number({ description: "cycles/sec for submit" })),
+			cycles: Type.Optional(Type.Number({ description: "render cycles for submit" })),
+			withLive: Type.Optional(Type.Boolean({ description: "provision the render with the live mix for comparison" })),
+			id: Type.Optional(Type.String({ description: "job id for report" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			if (params.action === "snapshotLive") {
+				return { content: [{ type: "text", text: await snapshotLiveStack() }], details: {} };
+			}
+			const res = runCtl(AUDITION_CTL, buildAuditionArgs(params.action, params));
+			const raw = res.stdout.trim();
+			if (params.action === "submit") {
+				if (res.code !== 0) return { content: [{ type: "text", text: `audition submit failed (exit ${res.code}):\n${(res.stderr || res.stdout).trim() || "(no output)"}` }], details: { code: res.code } };
+				const id = parseAuditionSubmitId(res.stdout);
+				return { content: [{ type: "text", text: `job ${id} submitted; poll with action=report id=${id}\n${raw}` }], details: { id } };
+			}
+			if (params.action === "report") {
+				const report = parseAuditionReport(res.stdout, { exitCode: res.code });
+				if (report === null) return { content: [{ type: "text", text: `audition report ${params.id} failed (exit ${res.code}):\n${(res.stderr || res.stdout).trim() || "(no output)"}` }], details: { code: res.code } };
+				if (isAuditionStillRunning(res.code) || report.state === "running") {
+					return { content: [{ type: "text", text: `job ${params.id} is still running; poll again.\n${raw}` }], details: report };
+				}
+				return { content: [{ type: "text", text: raw || JSON.stringify(report) }], details: report };
+			}
+			if (params.action === "jobs") {
+				return { content: [{ type: "text", text: raw || "(no jobs)" }], details: { jobs: parseAuditionJobs(res.stdout) } };
+			}
+			if (params.action === "status") {
+				return { content: [{ type: "text", text: raw || res.stderr.trim() || "(no output)" }], details: parseAuditionStatus(res.stdout) };
+			}
+			if (res.code !== 0) {
+				return { content: [{ type: "text", text: `audition ${params.action} failed (exit ${res.code}):\n${(res.stderr || res.stdout).trim() || "(no output)"}` }], details: { code: res.code } };
+			}
+			return { content: [{ type: "text", text: raw || `audition ${params.action}: ok` }], details: {} };
 		},
 	});
 
