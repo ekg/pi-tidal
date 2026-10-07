@@ -1,0 +1,17 @@
+[Unit]
+Description=Tidal low-latency audio stream daemon (streamd)
+Documentation=file:%h/pi-tidal/tools/stream/README.md
+After=pipewire.service wireplumber.service tidal-stream-sink.service
+Wants=tidal-stream-sink.service
+Requires=pipewire.service
+
+[Service]
+Type=simple
+# PATH puts the nvm node first; /usr/bin is the fallback.
+Environment=PATH=%h/.nvm/versions/node/v24.21.0/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env node %h/pi-tidal/tools/stream/streamd.mjs
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

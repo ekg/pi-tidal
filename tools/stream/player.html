@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>tidal stream player</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background:#111; color:#ddd; margin:0; padding:2rem; }
+  h1 { font-size:1.1rem; }
+  button { font: inherit; padding:.5rem 1rem; background:#2b6; color:#011; border:0; border-radius:4px; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  table { border-collapse:collapse; margin-top:1rem; }
+  td { padding:.15rem .8rem .15rem 0; }
+  td.k { color:#888; }
+  #log { margin-top:1rem; color:#888; white-space:pre-wrap; }
+  .warn { color:#e94; }
+</style>
+</head>
+<body>
+<h1>tidal stream player</h1>
+<p>Low-latency playout with an adaptive fill controller. Click start to
+unlock audio, then connect.</p>
+<p><button id="start" disabled>start audio</button>
+   <button id="connect">connect</button>
+   <span id="state">idle</span></p>
+<table>
+  <tr><td class="k">seq</td><td id="seq">-</td></tr>
+  <tr><td class="k">fill</td><td id="fill">-</td></tr>
+  <tr><td class="k">jitter est</td><td id="jitter">-</td></tr>
+  <tr><td class="k">target Ft</td><td id="ft">-</td></tr>
+  <tr><td class="k">dropped frames</td><td id="dropped">0</td></tr>
+  <tr><td class="k">underruns</td><td id="underruns">0</td></tr>
+  <tr><td class="k">discontinuities</td><td id="disc">0</td></tr>
+</table>
+<div id="log"></div>
+
+<!-- AudioWorklet source kept as text so the single-file page can build it
+     into a Blob URL without escaping. -->
+<script type="text/plain" id="processor-src">
+class StreamPlayer extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    this.rate = sampleRate;
+    this.frameMs = (options.processorOptions && options.processorOptions.frameMs) || 20;
+    this.capFrames = Math.ceil(this.rate * 0.5); // 500 ms capacity
+    this.buf = new Float32Array(this.capFrames * 2);
+    this.writePos = 0;
+    this.readPos = 0;
+    this.repriming = true;
+    this.jitterEst = -1;
+    this.alpha = 0.05;
+    this.dropped = 0;
+    this.underruns = 0;
+    this.disc = 0;
+    this.seq = 0;
+    this.lastArrival = 0;
+    this.lastStats = currentTime;
+    this.port.onmessage = (e) => this.onFrame(e.data);
+  }
+  ft() { return Math.min(250, Math.max(60, 3 * this.jitterEst)); }
+  onFrame(m) {
+    const now = currentTime * 1000;
+    if (m.type === 'ctrl') { this.seq = m.seq; return; }
+    if (this.lastArrival > 0) {
+      const dev = Math.abs((now - this.lastArrival) - this.frameMs);
+      this.jitterEst = this.jitterEst < 0 ? dev : (this.alpha * dev + (1 - this.alpha) * this.jitterEst);
+    }
+    this.lastArrival = now;
+    if (this.jitterEst < 0) this.jitterEst = 0;
+    if (m.flags & 1) { // discontinuity: hard resync
+      this.disc++;
+      this.readPos = this.writePos;
+      this.repriming = true;
+    }
+    const frames = m.frames;
+    const nFrames = frames.length / 2;
+    for (let i = 0; i < nFrames; i++) {
+      const slot = ((this.writePos + i) % this.capFrames) * 2;
+      this.buf[slot] = frames[i * 2] / 32768;
+      this.buf[slot + 1] = frames[i * 2 + 1] / 32768;
+    }
+    this.writePos += nFrames;
+    if (this.writePos - this.readPos > this.capFrames) {
+      this.readPos = this.writePos - this.capFrames;
+    }
+    this.seq = m.seq;
+  }
+  process(inputs, outputs) {
+    const out = outputs[0];
+    const L = out[0];
+    const R = out[1] || out[0];
+    const n = L.length;
+    const ftFrames = Math.round((this.ft() / 1000) * this.rate);
+    const fmaxFrames = Math.round(((this.ft() + 80) / 1000) * this.rate);
+    let fill = this.writePos - this.readPos;
+    if (fill > fmaxFrames) { // overfill: drop oldest to Ft
+      const drop = fill - ftFrames;
+      this.readPos += drop;
+      this.dropped += drop;
+      fill = this.writePos - this.readPos;
+    }
+    if (this.repriming) {
+      if (fill >= ftFrames) {
+        this.readPos = this.writePos - ftFrames;
+        this.repriming = false;
+        fill = ftFrames;
+      } else {
+        L.fill(0); R.fill(0);
+        this.report();
+        return true;
+      }
+    }
+    if (fill < n) { // underfill: silence-pad + refill to Ft
+      this.underruns++;
+      L.fill(0); R.fill(0);
+      this.readPos = this.writePos;
+      this.repriming = true;
+      this.report();
+      return true;
+    }
+    for (let i = 0; i < n; i++) {
+      const slot = ((this.readPos + i) % this.capFrames) * 2;
+      L[i] = this.buf[slot];
+      R[i] = this.buf[slot + 1];
+    }
+    this.readPos += n;
+    this.report();
+    return true;
+  }
+  report() {
+    if (currentTime * 1000 - this.lastStats < 200) return;
+    this.lastStats = currentTime * 1000;
+    this.port.postMessage({
+      type: 'stats',
+      seq: this.seq,
+      fillMs: ((this.writePos - this.readPos) / this.rate) * 1000,
+      jitterMs: this.jitterEst,
+      ft: this.ft(),
+      dropped: this.dropped,
+      underruns: this.underruns,
+      disc: this.disc,
+      repriming: this.repriming,
+    });
+  }
+}
+registerProcessor('stream-player', StreamPlayer);
+</script>
+
+<script>
+const FRAME_BYTES = 3840;      // 960 samples/ch * 2ch * 2 bytes
+const MSG_BYTES = 13 + FRAME_BYTES;
+
+const el = (id) => document.getElementById(id);
+const logEl = el('log');
+function log(msg) { logEl.textContent += msg + '\n'; }
+
+let ctx = null;
+let node = null;
+let ws = null;
+let wsClosedByUser = false;
+
+const params = new URLSearchParams(window.location.search);
+const token = params.get('token') || '';
+const wsUrl = () => {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const host = window.location.host || '127.0.0.1:8787';
+  return `${proto}//${host}/` + (token ? `?token=${encodeURIComponent(token)}` : '');
+};
+
+async function startAudio() {
+  ctx = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
+  const src = el('processor-src').textContent;
+  const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+  await ctx.audioWorklet.addModule(url);
+  URL.revokeObjectURL(url);
+  node = new AudioWorkletNode(ctx, 'stream-player', {
+    numberOfInputs: 0,
+    numberOfOutputs: 1,
+    outputChannelCount: [2],
+    processorOptions: { frameMs: 20 },
+  });
+  node.port.onmessage = (e) => {
+    const s = e.data;
+    if (s.type !== 'stats') return;
+    el('seq').textContent = s.seq;
+    el('fill').textContent = s.fillMs.toFixed(1) + ' ms' + (s.repriming ? ' (priming)' : '');
+    el('jitter').textContent = s.jitterMs.toFixed(1) + ' ms';
+    el('ft').textContent = s.ft.toFixed(0) + ' ms';
+    el('dropped').textContent = s.dropped;
+    el('underruns').textContent = s.underruns;
+    el('disc').textContent = s.disc;
+  };
+  node.connect(ctx.destination);
+  await ctx.resume();
+  el('start').disabled = true;
+  el('connect').disabled = false;
+  el('state').textContent = 'audio ready (' + ctx.sampleRate + ' Hz)';
+  log('AudioContext latencyHint=interactive, sampleRate=' + ctx.sampleRate);
+}
+
+function connect() {
+  if (!node) { log('start audio first'); return; }
+  wsClosedByUser = false;
+  const url = wsUrl();
+  log('connecting ' + url);
+  ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { el('state').textContent = 'connected'; log('ws open'); };
+  ws.onclose = () => {
+    el('state').textContent = 'disconnected';
+    log('ws closed');
+    if (!wsClosedByUser) setTimeout(connect, 1000);
+  };
+  ws.onerror = () => log('ws error');
+  ws.onmessage = (ev) => {
+    const buf = ev.data;
+    if (buf.byteLength === MSG_BYTES) {
+      const view = new DataView(buf);
+      const seq = view.getUint32(0, true);
+      const flags = view.getUint8(12);
+      const arr = new Int16Array(FRAME_BYTES / 2);
+      new Uint8Array(arr.buffer).set(new Uint8Array(buf, 13, FRAME_BYTES));
+      node.port.postMessage({ type: 'frame', seq, flags, frames: arr }, [arr.buffer]);
+    } else if (buf.byteLength === 5 && new Uint8Array(buf)[0] === 0x01) {
+      const seq = new DataView(buf).getUint32(1, true);
+      node.port.postMessage({ type: 'ctrl', seq });
+    }
+  };
+}
+
+el('start').disabled = false;
+el('connect').disabled = true;
+el('start').addEventListener('click', () => startAudio().catch((e) => log('start failed: ' + e.message)));
+el('connect').addEventListener('click', connect);
+</script>
+</body>
+</html>

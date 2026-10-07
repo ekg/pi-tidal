@@ -1,0 +1,155 @@
+# tools/stream — low-latency Tidal audio stream (lane 1)
+
+Implements the *stream* half of `docs/stream-audition.md` (contract v0):
+
+```
+scsynth ──► tidal_stream (virtual Audio/Sink, monitor, NOT routed to hardware)
+                 │  pw-record --target tidal_stream --format s16 --rate 48000 --channels 2 -
+                 ▼
+             streamd (Node, no npm deps)  ── WS binary, 20 ms frames, drop-oldest
+                 ▼
+             browser player.html: AudioWorklet ring buffer + adaptive fill controller
+```
+
+## Files
+
+| File | Role |
+|---|---|
+| `streamd.mjs` | Node daemon: capture, framing, WS broadcast, watchdog, `/status` |
+| `stream-ctl` | CLI: `enable\|disable\|start\|stop\|status\|url` |
+| `player.html` | self-contained browser player (served at `/` by streamd) |
+| `sink-setup.sh` | idempotent `create` (detached, returns once up) / `create-fg` (foreground, for systemd) / `destroy` of the `tidal_stream` sink |
+| `../../systemd/tidal-stream-sink.service` | runs `sink-setup.sh create-fg` |
+| `../../systemd/tidal-stream.service` | runs `streamd.mjs` |
+
+## Config
+
+`~/.config/tidal-stream/config.json` (missing file = all off). Every field can
+be overridden by env `PI_TIDAL_STREAM_<NAME>` (e.g. `PI_TIDAL_STREAM_PORT`),
+and the config path by `PI_TIDAL_STREAM_CONFIG`.
+
+```json
+{
+  "enabled": false,
+  "bind": "0.0.0.0",
+  "port": 8787,
+  "token": "",
+  "format": "s16",
+  "rate": 48000,
+  "channels": 2,
+  "frameMs": 20,
+  "sink": "tidal_stream",
+  "sourceNode": "tidal_stream"
+}
+```
+
+`enabled:false` ⇒ both units stopped/disabled, nothing created, no port bound.
+
+## Enable / disable
+
+```sh
+tools/stream/stream-ctl enable    # write enabled:true, enable --now both units
+tools/stream/stream-ctl disable   # stop+disable units, destroy sink, enabled:false
+tools/stream/stream-ctl start|stop
+tools/stream/stream-ctl status    # parseable status lines
+tools/stream/stream-ctl url       # WS URL (+ tailnet hostname, best-effort)
+```
+
+`status` prints exactly (parseable, one per line):
+
+```
+sink: present|absent
+source linked: yes|no
+listeners: <n>
+frames/sec: <n>
+dropped: <n>
+source: up|down
+```
+
+Schema mirror: each field is `key: value` with a single space, so
+`awk -F': ' '$1=="source"{print $2}'` works.
+
+## Wire protocol
+
+One WS message = one frame, 3853 bytes, all integers little-endian:
+
+| offset | type | meaning |
+|---|---|---|
+| 0 | uint32 | `seq`, monotonic, wraps at 2^32 |
+| 4 | float64 | `sentMs` (`Date.now()` at read) |
+| 12 | uint8 | `flags`, bit0 = discontinuity |
+| 13 | bytes | s16le interleaved stereo, 960 samples/ch = 3840 bytes |
+
+Server queue per connection: **at most 2 frames, drop-oldest**. A slow reader
+loses audio, never latency. A 1-byte client ping is answered with a 5-byte
+control frame `[0x01, uint32 seq LE]`.
+
+### Capture binding (required property)
+
+On this PipeWire/WirePlumber setup, plain `pw-record --target tidal_stream`
+links the record stream to the **default source (the mic)**, not the sink
+monitor. streamd therefore spawns:
+
+```
+pw-record --target tidal_stream --format s16 --rate 48000 --channels 2 \
+          -P '{"stream.capture.sink":true}' -
+```
+
+`stream.capture.sink=true` makes WirePlumber bind the record stream to the
+named sink's monitor ports. streamd additionally (1) waits for the sink node to
+exist before spawning, and (2) re-verifies the linkage against `pw-dump` every
+2 s, restarting capture if it ever drifts off the sink monitor.
+
+## Tailscale usage
+
+1. Bind: streamd binds `bind` (default `0.0.0.0:8787`).
+2. Token: set `"token"` in config; clients must connect to
+   `ws://host:8787/?token=<token>`. With an empty token, no auth (tailnet-only).
+3. Serve (HTTPS, no client install):
+
+   ```sh
+   tailscale serve --bg --https=443 http://127.0.0.1:8787
+   ```
+
+   Then open `https://<host>.<tailnet>.ts.net/?token=<token>`. `stream-ctl url`
+   prints the direct WS URL plus the tailnet hostname when available.
+
+## Verification procedure
+
+```sh
+# (a) sink exists and is unrouted
+./tools/stream/stream-ctl enable        # links units, starts sink + daemon
+wpctl status                             # tidal_stream [Audio/Sink] under Filters
+pw-link -l | grep tidal_stream_unrouted  # expect: no link to any hardware sink
+
+# (b) known tone -> frames with monotonic seq
+#     pw-play is the reliable feeder here; ffmpeg's pulse muxer on this build
+#     silently ignores -device and never reaches the virtual sink (see caveats).
+ffmpeg -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=3" -ac 2 /tmp/tone.wav -y
+node -e 'const s=new WebSocket("ws://127.0.0.1:8787/");s.binaryType="arraybuffer";let n=0,prev=-1,ok=true;s.onmessage=e=>{const q=new DataView(e.data).getUint32(0,true);if(prev>=0&&q!==(prev+1)>>>0)ok=false;prev=q;n++};setTimeout(()=>{console.log("frames",n,"monotonic",ok,"lastSeq",prev);process.exit(0)},4000)' &
+sleep 0.6; pw-play --target tidal_stream /tmp/tone.wav
+
+# (c) status
+./tools/stream/stream-ctl status         # source: up
+
+# (d) teardown leaves nothing bound
+./tools/stream/stream-ctl stop
+ss -ltnp | grep 8787                     # expect: empty
+wpctl status | grep tidal_stream         # expect: empty
+./tools/stream/stream-ctl disable        # stop+disable units, remove sink
+```
+
+## Notes / caveats
+
+- The sink is a `pw-loopback` whose playback side is `node.passive` +
+  `node.autoconnect=false`, so it never reaches physical output. This mirrors
+  `tools/tidal-main-loopback.sh` minus the auto-routing.
+- `pw-record --target tidal_stream` requires `stream.capture.sink=true` to
+  capture the sink monitor (see above); without it WirePlumber routes to the
+  default mic.
+- ffmpeg's `-f pulse -device tidal_stream` does **not** reach the virtual sink
+  on this build (the option is silently ignored and it plays to the default
+  sink). Use `pw-play --target tidal_stream <file>` to feed the tap.
+- `systemctl --user disable` removes the symlinked unit files as well as the
+  `default.target.wants` links; `stream-ctl enable` re-links them.
+- The daemon never exits when the source is down; it reports `source: down`.

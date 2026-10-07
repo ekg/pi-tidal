@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# stream-ctl — control the tidal_stream tap + streamd daemon.
+#
+# Verbs: enable | disable | start | stop | status | url
+# Config: ~/.config/tidal-stream/config.json (see docs/stream-audition.md),
+#         overridable by PI_TIDAL_STREAM_* env vars.
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$HERE/../.." && pwd)"
+SINK_SETUP="$HERE/sink-setup.sh"
+
+CONFIG_DIR="${PI_TIDAL_STREAM_CONFIG_DIR:-$HOME/.config/tidal-stream}"
+CONFIG="${PI_TIDAL_STREAM_CONFIG:-$CONFIG_DIR/config.json}"
+
+SINK_UNIT="tidal-stream-sink.service"
+DAEMON_UNIT="tidal-stream.service"
+
+# --- config helpers --------------------------------------------------------
+cfg() { # key default
+  local key="$1" def="$2" v=""
+  if [ -f "$CONFIG" ] && command -v jq >/dev/null 2>&1; then
+    v=$(jq -r --arg k "$key" 'if has($k) then (.[$k] | tostring) else empty end' "$CONFIG" 2>/dev/null || true)
+  fi
+  printf '%s' "${v:-$def}"
+}
+
+PORT="${PI_TIDAL_STREAM_PORT:-$(cfg port 8787)}"
+BIND="${PI_TIDAL_STREAM_BIND:-$(cfg bind 0.0.0.0)}"
+TOKEN="${PI_TIDAL_STREAM_TOKEN:-$(cfg token '')}"
+SINK="${PI_TIDAL_STREAM_SINK:-$(cfg sink tidal_stream)}"
+FORMAT="${PI_TIDAL_STREAM_FORMAT:-$(cfg format s16)}"
+RATE="${PI_TIDAL_STREAM_RATE:-$(cfg rate 48000)}"
+CHANNELS="${PI_TIDAL_STREAM_CHANNELS:-$(cfg channels 2)}"
+FRAME_MS="${PI_TIDAL_STREAM_FRAMEMS:-$(cfg frameMs 20)}"
+
+install_units() {
+  # Deploy the repo units via symlink, mirroring the existing convention in
+  # ~/.config/systemd/user. Idempotent; never touches other units.
+  local udir="$HOME/.config/systemd/user"
+  mkdir -p "$udir"
+  local u
+  for u in "$SINK_UNIT" "$DAEMON_UNIT"; do
+    if [ ! -e "$udir/$u" ]; then
+      ln -s "$REPO_DIR/systemd/$u" "$udir/$u"
+    fi
+  done
+  systemctl --user daemon-reload
+}
+
+write_default_config() { # enabled_value
+  mkdir -p "$CONFIG_DIR"
+  cat > "$CONFIG" <<EOF
+{
+  "enabled": $1,
+  "bind": "0.0.0.0",
+  "port": 8787,
+  "token": "",
+  "format": "s16",
+  "rate": 48000,
+  "channels": 2,
+  "frameMs": 20,
+  "sink": "tidal_stream",
+  "sourceNode": "tidal_stream"
+}
+EOF
+}
+
+set_enabled() { # true|false
+  local val="$1"
+  if [ -f "$CONFIG" ]; then
+    local tmp; tmp="$(mktemp)"
+    jq --argjson v "$val" '.enabled = $v' "$CONFIG" > "$tmp" && mv "$tmp" "$CONFIG"
+  else
+    write_default_config "$val"
+  fi
+}
+
+sink_present() {
+  if command -v pw-dump >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    [ -n "$(pw-dump 2>/dev/null | jq -r --arg n "$SINK" \
+      '.[] | select(.type=="PipeWire:Interface:Node" and .info.props["node.name"]==$n) | .id' 2>/dev/null)" ]
+  else
+    false
+  fi
+}
+
+daemon_status_json() {
+  # best-effort fetch of the daemon's /status endpoint on loopback
+  curl -fsS --max-time 1 "http://127.0.0.1:${PORT}/status?token=${TOKEN}" 2>/dev/null || true
+}
+
+# --- verbs -----------------------------------------------------------------
+do_enable() {
+  set_enabled true
+  install_units
+  systemctl --user enable --now "$SINK_UNIT" "$DAEMON_UNIT"
+  echo "enabled: sink + streamd units started"
+}
+
+do_disable() {
+  # stop first, then disable, so nothing is left bound
+  systemctl --user disable --now "$DAEMON_UNIT" "$SINK_UNIT" 2>/dev/null || true
+  "$SINK_SETUP" destroy >/dev/null 2>&1 || true
+  set_enabled false
+  echo "disabled: units stopped and disabled, sink removed"
+}
+
+do_start() {
+  install_units
+  systemctl --user start "$SINK_UNIT"
+  systemctl --user start "$DAEMON_UNIT"
+  echo "started"
+}
+
+do_stop() {
+  systemctl --user stop "$DAEMON_UNIT" 2>/dev/null || true
+  systemctl --user stop "$SINK_UNIT" 2>/dev/null || true
+  "$SINK_SETUP" destroy >/dev/null 2>&1 || true
+  echo "stopped"
+}
+
+do_status() {
+  local js; js="$(daemon_status_json)"
+  local sink_line="absent" daemon="down" src_linked="no" listeners="0" fps="0" dropped="0" source="down"
+  if sink_present; then sink_line="present"; fi
+  if [ -n "$js" ] && command -v jq >/dev/null 2>&1; then
+    daemon="up"
+    src_linked="$(jq -r 'if .captureAlive then "yes" else "no" end' <<<"$js")"
+    listeners="$(jq -r '.listeners' <<<"$js")"
+    fps="$(jq -r '.framesPerSec' <<<"$js")"
+    dropped="$(jq -r '.dropped' <<<"$js")"
+    source="$(jq -r '.source' <<<"$js")"
+  fi
+  echo "sink: $sink_line"
+  echo "source linked: $src_linked"
+  echo "listeners: $listeners"
+  echo "frames/sec: $fps"
+  echo "dropped: $dropped"
+  echo "source: $source"
+  echo "daemon: $daemon"
+  echo "enabled: $(cfg enabled false)"
+}
+
+do_url() {
+  # direct WS URL
+  local host="$BIND"
+  if [ "$host" = "0.0.0.0" ]; then host="127.0.0.1"; fi
+  local qs=""
+  [ -n "$TOKEN" ] && qs="?token=${TOKEN}"
+  echo "ws://${host}:${PORT}/${qs}"
+  # best-effort tailnet hostname; never fatal
+  if command -v tailscale >/dev/null 2>&1; then
+    local ts
+    ts="$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' 2>/dev/null | sed 's/\.$//')" || ts=""
+    if [ -n "$ts" ]; then
+      echo "tailscale: ${ts}"
+      echo "  direct:  ws://${ts}:${PORT}/${qs}"
+      echo "  serve:   tailscale serve --bg --https=443 http://127.0.0.1:${PORT}"
+    fi
+  fi
+}
+
+case "${1:-}" in
+  enable)  do_enable ;;
+  disable) do_disable ;;
+  start)   do_start ;;
+  stop)    do_stop ;;
+  status)  do_status ;;
+  url)     do_url ;;
+  *)
+    echo "usage: $0 enable|disable|start|stop|status|url" >&2
+    exit 2
+    ;;
+esac

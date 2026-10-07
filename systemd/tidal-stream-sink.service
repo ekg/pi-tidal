@@ -1,0 +1,16 @@
+[Unit]
+Description=Tidal Stream virtual sink (tidal_stream tap)
+Documentation=file:%h/pi-tidal/tools/stream/README.md
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+PartOf=tidal-stream.service
+
+[Service]
+Type=simple
+ExecStart=%h/pi-tidal/tools/stream/sink-setup.sh create-fg
+ExecStop=%h/pi-tidal/tools/stream/sink-setup.sh destroy
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
