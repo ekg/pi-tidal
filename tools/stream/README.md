@@ -162,6 +162,30 @@ exist before spawning, and (2) re-verifies the linkage against `pw-dump` every
    Then open `https://<host>.<tailnet>.ts.net/?token=<token>`. `stream-ctl url`
    prints the direct WS URL plus the tailnet hostname when available.
 
+## Measuring from the listener
+
+`stream-ctl status` is the SERVER's view: frames/sec, listeners, bytes. It
+cannot tell you whether a remote client will glitch, and "the source is pushing
+bytes" is not evidence a listener can keep up.
+
+```
+node tools/stream/probe.mjs [host] [port] [seconds]
+node tools/stream/probe.mjs puppost.tail334fe6.ts.net 8787 60
+```
+
+Run it from the machine you will actually listen on. It reports frame rate, lost
+frames, jitter, the arrival tail (p95/p99/p99.9/max), and predicts underruns for
+several buffer targets by replaying the observed arrivals through the player's
+fill policy.
+
+**Reading it:** the exposure is the arrival TAIL, not the average. Measured over
+Tailscale from a remote host (~140 ms RTT, direct IPv6): 50 fps, 7.6 ms jitter,
+~0 drift — but one 60 s window contained a 450 ms stall, predicting ~4
+underruns/min at any target from 60 to 260 ms (a longer target only shortens each
+silence gap). A separate 30 s window was clean (max 120 ms), so path quality
+varies. A stall longer than the buffer cannot be buffered away without paying
+that latency permanently. See `docs/stream-audition.md` field note 10.
+
 ## Verification procedure
 
 ```sh
