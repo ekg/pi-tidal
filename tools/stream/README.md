@@ -69,6 +69,54 @@ source: up|down
 Schema mirror: each field is `key: value` with a single space, so
 `awk -F': ' '$1=="source"{print $2}'` works.
 
+## Outputs
+
+One capture feeds N outputs; each is enabled in config and togglable at
+runtime. `ws-pcm` (the browser WS/PCM path) is on by default; `icecast` and
+`hls` are off by default and cost nothing until enabled (no process spawned).
+
+```json
+{
+  "outputs": {
+    "ws-pcm": { "enabled": true },
+    "icecast": {
+      "enabled": false, "host": "127.0.0.1", "port": 8000,
+      "mount": "/stream.ogg", "sourceUser": "source",
+      "sourcePassword": "hackme", "bitrate": 96
+    },
+    "hls": {
+      "enabled": false, "dir": "/tmp/tidal-stream-hls",
+      "segmentMs": 2000, "listSize": 6, "bitrate": 128, "codec": "aac"
+    }
+  }
+}
+```
+
+- **icecast** — `icecast.mjs` spawns ffmpeg reading s16le PCM on stdin and
+  pushing Ogg/Opus to `icecast://<user>:<pass>@<host>:<port><mount>`. If the
+  server is unreachable/refused (ffmpeg exits) or ffmpeg is missing, the error
+  shows in `status()` and the output retries on a bounded backoff. A stalled
+  server drops frames rather than growing latency (same philosophy as ws-pcm's
+  drop-oldest). Listen with `ffplay`:
+  `ffplay -i http://<host>:8000/stream.ogg` (VLC: Network → the same URL).
+- **hls** — `hls.mjs` spawns ffmpeg writing an fMP4/AAC playlist + segments
+  into `dir`, served by streamd at `/hls/index.m3u8` (playlist no-store). Open
+  in a browser with an HLS-capable player (Safari natively, or a page using
+  hls.js) at `http://<host>:8787/hls/index.m3u8`.
+
+Runtime toggle (no restart — the capture and the other outputs keep running):
+
+```sh
+tools/stream/stream-ctl output on icecast
+tools/stream/stream-ctl output off icecast
+tools/stream/stream-ctl output on hls
+tools/stream/stream-ctl outputs      # name enabled active listeners dropped bytesOut error
+```
+
+`output on|off` drives `POST /control?token=<token>`
+`{"output":"<name>","action":"on|off"}` when the daemon is up, and falls
+back to editing `config.json` when it is down.
+
 ## Wire protocol
 
 One WS message = one frame, 3853 bytes, all integers little-endian:

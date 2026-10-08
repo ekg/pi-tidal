@@ -141,7 +141,7 @@ do_status() {
   echo "daemon: $daemon"
   echo "enabled: $(cfg enabled false)"
   if [ -n "$js" ] && command -v jq >/dev/null 2>&1; then
-    jq -r '.outputs[]? | "output: \(.name) enabled=\(.enabled) active=\(.active)" + (if (.listeners|type)=="number" then " listeners=\(.listeners)" else "" end)' <<<"$js"
+    jq -r '.outputs[]? | "output: \(.name) enabled=\(.enabled) active=\(.active)" + (if (.listeners|type)=="number" then " listeners=\(.listeners)" else "" end) + (if (.dropped|type)=="number" then " dropped=\(.dropped)" else "" end) + (if (.bytesOut|type)=="number" then " bytesOut=\(.bytesOut)" else "" end) + (if (.error|type)=="string" and .error != "" then " error=\(.error)" else "" end)' <<<"$js"
   fi
 }
 
@@ -178,7 +178,7 @@ do_outputs() {
   local js; js="$(daemon_status_json)"
   if [ -z "$js" ]; then echo "daemon: down (no live output state)"; return; fi
   if ! command -v jq >/dev/null 2>&1; then echo "$js"; return; fi
-  jq -r '.outputs[]? | "\(.name)\tenabled=\(.enabled)\tactive=\(.active)" + (if (.listeners|type)=="number" then "\tlisteners=\(.listeners)" else "" end) + (if (.dropped|type)=="number" then "\tdropped=\(.dropped)" else "" end)' <<<"$js"
+  jq -r '.outputs[]? | "\(.name)\tenabled=\(.enabled)\tactive=\(.active)" + (if (.listeners|type)=="number" then "\tlisteners=\(.listeners)" else "" end) + (if (.dropped|type)=="number" then "\tdropped=\(.dropped)" else "" end) + (if (.bytesOut|type)=="number" then "\tbytesOut=\(.bytesOut)" else "" end) + (if (.error|type)=="string" and .error != "" then "\terror=\(.error)" else "" end)' <<<"$js"
 }
 
 do_url() {
