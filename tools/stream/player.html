@@ -29,7 +29,7 @@ unlock audio, then connect.</p>
   <tr><td class="k">fill</td><td id="fill">-</td></tr>
   <tr><td class="k">jitter est</td><td id="jitter">-</td></tr>
   <tr><td class="k">target Ft</td><td id="ft">-</td></tr>
-  <tr><td class="k">dropped frames</td><td id="dropped">0</td></tr>
+  <tr><td class="k">dropped audio</td><td id="dropped">0 ms</td></tr>
   <tr><td class="k">underruns</td><td id="underruns">0</td></tr>
   <tr><td class="k">discontinuities</td><td id="disc">0</td></tr>
 </table>
@@ -137,7 +137,12 @@ class StreamPlayer extends AudioWorkletProcessor {
       fillMs: ((this.writePos - this.readPos) / this.rate) * 1000,
       jitterMs: this.jitterEst,
       ft: this.ft(),
-      dropped: this.dropped,
+      // `this.dropped` is counted in sample frames — the ring buffer's natural
+      // unit — but reporting it raw made the UI claim "dropped frames" while the
+      // daemon's `dropped` counts 20 ms frames. Report milliseconds so the two
+      // cannot be confused: a reconnect catch-up of a few hundred ms shows up as
+      // a 3-4 digit number, which is audio time, not lost packets.
+      droppedMs: (this.dropped / this.rate) * 1000,
       underruns: this.underruns,
       disc: this.disc,
       repriming: this.repriming,
@@ -187,7 +192,7 @@ async function startAudio() {
     el('fill').textContent = s.fillMs.toFixed(1) + ' ms' + (s.repriming ? ' (priming)' : '');
     el('jitter').textContent = s.jitterMs.toFixed(1) + ' ms';
     el('ft').textContent = s.ft.toFixed(0) + ' ms';
-    el('dropped').textContent = s.dropped;
+    el('dropped').textContent = s.droppedMs.toFixed(0) + ' ms';
     el('underruns').textContent = s.underruns;
     el('disc').textContent = s.disc;
   };
