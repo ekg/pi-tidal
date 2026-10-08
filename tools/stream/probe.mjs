@@ -5,8 +5,13 @@
 // frame rate, inter-arrival jitter, lost frames, and the transport stalls that
 // decide whether the playout buffer will underrun in normal use.
 //
-//   node probe.mjs [host] [port] [seconds]
+//   node probe.mjs [host] [port] [seconds] [frameMs]
 //   node probe.mjs puppost.tail334fe6.ts.net 8787 60
+//   node probe.mjs puppost.tail334fe6.ts.net 8787 60 10   # 10 ms frames
+//
+// frameMs must match the server's config (frameMs is configurable: check
+// `curl host:port/status`). The default is 20 ms; getting it wrong makes the
+// jitter and fill predictions meaningless.
 //
 // Why this exists: `stream-ctl status` reports the SERVER's view (frames/sec,
 // listeners, bytes). It cannot tell you whether a remote client will glitch,
@@ -25,7 +30,7 @@ import crypto from 'node:crypto';
 const HOST = process.argv[2] || '127.0.0.1';
 const PORT = Number(process.argv[3] || 8787);
 const SECS = Number(process.argv[4] || 30);
-const FRAME_MS = 20;
+const FRAME_MS = Number(process.argv[5] || 20);
 
 const key = crypto.randomBytes(16).toString('base64');
 const socket = net.connect(PORT, HOST, () => {

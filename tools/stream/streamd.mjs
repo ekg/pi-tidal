@@ -62,6 +62,10 @@ const DEFAULTS = {
   rate: 48000,
   channels: 2,
   frameMs: 20,
+  // Client-side target floor (ms): the dominant latency term. The player reads
+  // this from /status; lower = tighter latency, more underrun risk. The page's
+  // profile control can override it live without touching this.
+  fillFloorMs: 60,
   sink: 'tidal_stream',
   sourceNode: 'tidal_stream',
   // Per-output state. Missing entry => the output's own default. ws-pcm is on
@@ -105,6 +109,7 @@ function loadConfig() {
   cfg.rate = num('RATE', cfg.rate);
   cfg.channels = num('CHANNELS', cfg.channels);
   cfg.frameMs = num('FRAMEMS', cfg.frameMs);
+  cfg.fillFloorMs = num('FILLFLOORMS', cfg.fillFloorMs);
   cfg.sink = str('SINK', cfg.sink);
   cfg.sourceNode = str('SOURCENODE', cfg.sourceNode);
   return cfg;
@@ -616,6 +621,7 @@ function statusPayload() {
     dropped: wsPcm.status().dropped,
     seq,
     frameMs: FRAME_MS,
+    fillFloorMs: Number(cfg.fillFloorMs),
     rate: RATE,
     channels: CHANNELS,
     source: sourceUp ? 'up' : 'down',

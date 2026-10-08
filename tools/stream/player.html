@@ -24,6 +24,13 @@ unlock audio, then connect.</p>
 <p><button id="start" disabled>start audio</button>
    <button id="connect">connect</button>
    <span id="state">idle</span></p>
+<p><label>latency profile
+   <select id="profile">
+     <option value="30">low — 30 ms</option>
+     <option value="60" selected>normal — 60 ms</option>
+     <option value="120">stable — 120 ms</option>
+   </select></label>
+   <span id="pmode"></span></p>
 <table>
   <tr><td class="k">seq</td><td id="seq">-</td></tr>
   <tr><td class="k">fill</td><td id="fill">-</td></tr>
@@ -43,6 +50,9 @@ class StreamPlayer extends AudioWorkletProcessor {
     super();
     this.rate = sampleRate;
     this.frameMs = (options.processorOptions && options.processorOptions.frameMs) || 20;
+    // Client-side target floor: the dominant latency term. The server advertises
+    // its default in /status; the page's profile control can change it live.
+    this.fillFloorMs = (options.processorOptions && options.processorOptions.fillFloorMs) || 60;
     this.capFrames = Math.ceil(this.rate * 0.5); // 500 ms capacity
     this.buf = new Float32Array(this.capFrames * 2);
     this.writePos = 0;
@@ -60,10 +70,22 @@ class StreamPlayer extends AudioWorkletProcessor {
     this.lastStats = currentTime;
     this.port.onmessage = (e) => this.onFrame(e.data);
   }
-  ft() { return Math.min(250, Math.max(60, 3 * this.jitterEst)); }
+  ft() { return Math.min(250, Math.max(this.fillFloorMs, 3 * this.jitterEst)); }
   onFrame(m) {
     const now = currentTime * 1000;
     if (m.type === 'ctrl') { this.seq = m.seq; return; }
+    if (m.type === 'setFloor') {
+      const next = Math.max(10, Math.min(250, m.fillFloorMs));
+      const raised = next > this.fillFloorMs;
+      this.fillFloorMs = next;
+      // Raising the target must actually ADD buffering: the buffer only grows by
+      // repriming, so without this the control would claim 120 ms of safety
+      // while fill stayed wherever it was, and the next stall would underrun
+      // anyway. Lowering it does not need a re-prime (the drop rules shed).
+      const fillMs = ((this.writePos - this.readPos) / this.rate) * 1000;
+      if (raised && fillMs < next) this.repriming = true;
+      return;
+    }
     if (this.lastArrival > 0) {
       const dev = Math.abs((now - this.lastArrival) - this.frameMs);
       this.jitterEst = this.jitterEst < 0 ? dev : (this.alpha * dev + (1 - this.alpha) * this.jitterEst);
@@ -175,8 +197,59 @@ registerProcessor('stream-player', StreamPlayer);
 </script>
 
 <script>
-const FRAME_BYTES = 3840;      // 960 samples/ch * 2ch * 2 bytes
-const MSG_BYTES = 13 + FRAME_BYTES;
+// Frame geometry comes from the SERVER (/status): frameMs is configurable, so
+// hardcoding 20 ms here would silently desync the client the moment the stream
+// is tuned for latency. fillFloorMs is the client-side target floor — the
+// dominant latency term — and the profile control can change it live.
+let FRAME_MS = 20;
+let FILL_FLOOR_MS = 60;
+let CHANNELS = 2;
+let FRAME_BYTES = 3840;        // rate/1000 * frameMs * channels * 2 (s16)
+let MSG_BYTES = 13 + FRAME_BYTES;
+let RATE = 48000;
+
+function recomputeGeometry() {
+  FRAME_BYTES = Math.round((RATE * FRAME_MS) / 1000) * CHANNELS * 2;
+  MSG_BYTES = 13 + FRAME_BYTES;
+  if (el('pmode')) {
+    el('pmode').textContent = `${RATE} Hz · ${FRAME_MS} ms frames · floor ${FILL_FLOOR_MS} ms`;
+  }
+}
+
+function syncProfileControl() {
+  const sel = el('profile');
+  if (!sel) return;
+  const v = String(FILL_FLOOR_MS);
+  if ([...sel.options].some((o) => o.value === v)) {
+    sel.value = v;
+    return;
+  }
+  // The server's floor is not one of the presets: show what is actually in
+  // force rather than leaving the control displaying a value that is not true.
+  const o = document.createElement('option');
+  o.value = v;
+  o.textContent = `server — ${v} ms`;
+  sel.appendChild(o);
+  sel.value = v;
+}
+
+function applyGeometry(s) {
+  FRAME_MS = Number(s.frameMs) || FRAME_MS;
+  RATE = Number(s.rate) || RATE;
+  CHANNELS = Number(s.channels) || CHANNELS;
+  if (Number.isFinite(Number(s.fillFloorMs))) FILL_FLOOR_MS = Number(s.fillFloorMs);
+  recomputeGeometry();
+  syncProfileControl();
+}
+
+async function loadProfile() {
+  try {
+    const r = await fetch('/status' + (token ? `?token=${encodeURIComponent(token)}` : ''), { cache: 'no-store' });
+    if (r.ok) applyGeometry(await r.json());
+  } catch (e) {
+    log('profile fetch failed, using defaults: ' + e.message);
+  }
+}
 
 const el = (id) => document.getElementById(id);
 const logEl = el('log');
@@ -196,7 +269,7 @@ const wsUrl = () => {
 };
 
 async function startAudio() {
-  ctx = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
+  ctx = new AudioContext({ latencyHint: 'interactive', sampleRate: RATE });
   const src = el('processor-src').textContent;
   const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
   await ctx.audioWorklet.addModule(url);
@@ -205,7 +278,7 @@ async function startAudio() {
     numberOfInputs: 0,
     numberOfOutputs: 1,
     outputChannelCount: [2],
-    processorOptions: { frameMs: 20 },
+    processorOptions: { frameMs: FRAME_MS, fillFloorMs: FILL_FLOOR_MS },
   });
   node.port.onmessage = (e) => {
     const s = e.data;
@@ -260,6 +333,15 @@ el('start').disabled = false;
 el('connect').disabled = true;
 el('start').addEventListener('click', () => startAudio().catch((e) => log('start failed: ' + e.message)));
 el('connect').addEventListener('click', connect);
+el('profile').addEventListener('change', () => {
+  FILL_FLOOR_MS = Number(el('profile').value);
+  if (node) node.port.postMessage({ type: 'setFloor', fillFloorMs: FILL_FLOOR_MS });
+  recomputeGeometry();
+  syncProfileControl();
+  log('latency profile -> floor ' + FILL_FLOOR_MS + ' ms (lower = tighter, more underrun risk)');
+});
+recomputeGeometry();
+loadProfile();
 </script>
 </body>
 </html>
