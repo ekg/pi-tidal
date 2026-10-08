@@ -33,6 +33,7 @@ unlock audio, then connect.</p>
    <span id="pmode"></span></p>
 <table>
   <tr><td class="k">seq</td><td id="seq">-</td></tr>
+  <tr><td class="k">behind live</td><td id="behind">-</td></tr>
   <tr><td class="k">fill</td><td id="fill">-</td></tr>
   <tr><td class="k">jitter est</td><td id="jitter">-</td></tr>
   <tr><td class="k">target Ft</td><td id="ft">-</td></tr>
@@ -207,6 +208,8 @@ let CHANNELS = 2;
 let FRAME_BYTES = 3840;        // rate/1000 * frameMs * channels * 2 (s16)
 let MSG_BYTES = 13 + FRAME_BYTES;
 let RATE = 48000;
+// Smoothed queue+transport age at arrival, from the frame's own sentMs stamp.
+let wireAgeMs = 0;
 let CODEC = 'pcm';             // 'pcm' | 'opus' — the wire format in use
 
 function recomputeGeometry() {
@@ -319,6 +322,12 @@ async function startAudio() {
     if (s.type !== 'stats') return;
     el('seq').textContent = s.seq;
     el('fill').textContent = s.fillMs.toFixed(1) + ' ms' + (s.repriming ? ' (priming)' : '');
+    // "behind live" = how old the audio reaching your ears is, right now:
+    // already-elapsed queue/transport age + the buffer still to be played +
+    // the browser's output stage. This is the figure comparable to the HLS
+    // page's "behind live" (which is seconds, by construction).
+    const outMs = ctx ? ((ctx.outputLatency || 0) + (ctx.baseLatency || 0)) * 1000 : 0;
+    el('behind').textContent = (wireAgeMs + s.fillMs + outMs).toFixed(0) + ' ms';
     el('jitter').textContent = s.jitterMs.toFixed(1) + ' ms';
     el('ft').textContent = s.ft.toFixed(0) + ' ms';
     el('dropped').textContent = s.droppedMs.toFixed(0) + ' ms';
@@ -409,7 +418,13 @@ function handlePcmMessage(buf) {
   if (buf.byteLength === MSG_BYTES) {
     const view = new DataView(buf);
     const seq = view.getUint32(0, true);
+    const sentMs = view.getFloat64(4, true);
     const flags = view.getUint8(12);
+    // Queue + transport age at arrival (the server stamps every frame with its
+    // own wall clock; same machine => same clock, and over a network the clocks
+    // may differ so this is only meaningful locally).
+    const age = Date.now() - sentMs;
+    if (age >= 0 && age < 60000) wireAgeMs = wireAgeMs ? wireAgeMs * 0.9 + age * 0.1 : age;
     const arr = new Int16Array(FRAME_BYTES / 2);
     new Uint8Array(arr.buffer).set(new Uint8Array(buf, 13, FRAME_BYTES));
     node.port.postMessage({ type: 'frame', seq, flags, frames: arr }, [arr.buffer]);
