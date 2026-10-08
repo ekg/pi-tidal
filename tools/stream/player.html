@@ -51,6 +51,8 @@ class StreamPlayer extends AudioWorkletProcessor {
     this.jitterEst = -1;
     this.alpha = 0.05;
     this.dropped = 0;
+    this.lastConvergeDrop = 0;   // last slow-convergence drop (ms, currentTime)
+    this.convergeIntervalMs = 400;
     this.underruns = 0;
     this.disc = 0;
     this.seq = 0;
@@ -98,6 +100,26 @@ class StreamPlayer extends AudioWorkletProcessor {
       const drop = fill - ftFrames;
       this.readPos += drop;
       this.dropped += drop;
+      fill = this.writePos - this.readPos;
+    }
+    // Slow convergence back to the target. The Fmax rule above only corrects
+    // large overfills, so without this a one-off disturbance (a capture restart,
+    // a network hiccup) leaves the playout sitting anywhere in (Ft, Fmax] for
+    // good - fill cannot fall on its own, since consumption only matches
+    // production. Correct frame-aligned and rate-limited: at most one 20 ms
+    // frame per convergeIntervalMs, and only while more than one frame above
+    // target. Frame-aligned drops match the server's own granularity and are the
+    // least audible way to shed latency.
+    const nowMs = currentTime * 1000;
+    const oneFrame = Math.round((this.frameMs / 1000) * this.rate);
+    if (
+      !this.repriming &&
+      fill > ftFrames + oneFrame &&
+      nowMs - this.lastConvergeDrop > this.convergeIntervalMs
+    ) {
+      this.readPos += oneFrame;
+      this.dropped += oneFrame;
+      this.lastConvergeDrop = nowMs;
       fill = this.writePos - this.readPos;
     }
     if (this.repriming) {
