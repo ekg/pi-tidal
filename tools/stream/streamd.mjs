@@ -43,6 +43,7 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createIcecastOutput, icecastDefaults } from './outputs/icecast.mjs';
 import { createHlsOutput, hlsDefaults } from './outputs/hls.mjs';
+import { createWsOpusOutput, wsOpusDefaults } from './outputs/ws-opus.mjs';
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -587,6 +588,8 @@ const wsPcm = createWsPcmOutput();
 const STREAM = { rate: RATE, channels: CHANNELS };
 registerOutput(createIcecastOutput(outputSettings('icecast', icecastDefaults), STREAM));
 registerOutput(createHlsOutput(outputSettings('hls', hlsDefaults), STREAM));
+// lane 6: Opus over our own WebSocket on /opus (defaults to off; ws-pcm keeps `/`).
+registerOutput(createWsOpusOutput(outputSettings('ws-opus', wsOpusDefaults), STREAM));
 
 // ===========================================================================
 // HTTP server: shared transport for /status, /control and every output's own

@@ -207,12 +207,13 @@ let CHANNELS = 2;
 let FRAME_BYTES = 3840;        // rate/1000 * frameMs * channels * 2 (s16)
 let MSG_BYTES = 13 + FRAME_BYTES;
 let RATE = 48000;
+let CODEC = 'pcm';             // 'pcm' | 'opus' — the wire format in use
 
 function recomputeGeometry() {
   FRAME_BYTES = Math.round((RATE * FRAME_MS) / 1000) * CHANNELS * 2;
   MSG_BYTES = 13 + FRAME_BYTES;
   if (el('pmode')) {
-    el('pmode').textContent = `${RATE} Hz · ${FRAME_MS} ms frames · floor ${FILL_FLOOR_MS} ms`;
+    el('pmode').textContent = `${RATE} Hz · ${FRAME_MS} ms frames · floor ${FILL_FLOOR_MS} ms · codec ${CODEC}`;
   }
 }
 
@@ -242,14 +243,44 @@ function applyGeometry(s) {
   syncProfileControl();
 }
 
+// Pick the wire format. `?codec=opus` forces Opus; otherwise Opus is
+// auto-selected only when ws-pcm is inactive and ws-opus is active. WebCodecs
+// is required to decode Opus — without it we fall back to PCM and say so rather
+// than streaming to a decoder that never produces audio.
+function decideCodec(s) {
+  const outputs = Array.isArray(s && s.outputs) ? s.outputs : [];
+  const pcmActive = outputs.some((o) => o.name === 'ws-pcm' && o.active);
+  const opusActive = outputs.some((o) => o.name === 'ws-opus' && o.active);
+  let codec = 'pcm';
+  if (selectedCodec === 'opus') codec = 'opus';
+  else if (!pcmActive && opusActive) codec = 'opus';
+  if (codec === 'opus' && typeof AudioDecoder === 'undefined') {
+    log('codec=opus requested but this browser has no WebCodecs AudioDecoder; falling back to PCM');
+    codec = 'pcm';
+  }
+  CODEC = codec;
+  // recomputeGeometry() renders ${CODEC}; it ran inside applyGeometry() BEFORE
+  // this assignment, so without this the header keeps showing the default and
+  // the page claims 'codec pcm' while decoding Opus.
+  recomputeGeometry();
+}
+
 async function loadProfile() {
   try {
     const r = await fetch('/status' + (token ? `?token=${encodeURIComponent(token)}` : ''), { cache: 'no-store' });
-    if (r.ok) applyGeometry(await r.json());
+    if (r.ok) {
+      const s = await r.json();
+      applyGeometry(s);
+      decideCodec(s);
+      log('codec: ' + CODEC + (selectedCodec ? ` (requested ${selectedCodec})` : ' (auto)'));
+    }
   } catch (e) {
     log('profile fetch failed, using defaults: ' + e.message);
   }
 }
+
+const params = new URLSearchParams(window.location.search);
+const selectedCodec = params.get('codec');
 
 const el = (id) => document.getElementById(id);
 const logEl = el('log');
@@ -259,13 +290,16 @@ let ctx = null;
 let node = null;
 let ws = null;
 let wsClosedByUser = false;
+let decoder = null;           // WebCodecs AudioDecoder (Opus path)
+let opusSeq = 0;
+let opusDiscPending = false;
 
-const params = new URLSearchParams(window.location.search);
 const token = params.get('token') || '';
 const wsUrl = () => {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const host = window.location.host || '127.0.0.1:8787';
-  return `${proto}//${host}/` + (token ? `?token=${encodeURIComponent(token)}` : '');
+  const path = CODEC === 'opus' ? '/opus' : '/';
+  return `${proto}//${host}${path}` + (token ? `?token=${encodeURIComponent(token)}` : '');
 };
 
 async function startAudio() {
@@ -296,7 +330,93 @@ async function startAudio() {
   el('start').disabled = true;
   el('connect').disabled = false;
   el('state').textContent = 'audio ready (' + ctx.sampleRate + ' Hz)';
-  log('AudioContext latencyHint=interactive, sampleRate=' + ctx.sampleRate);
+  log('AudioContext latencyHint=interactive, sampleRate=' + ctx.sampleRate + ', codec=' + CODEC);
+}
+
+// One Opus packet -> interleaved s16 -> the EXISTING worklet frame message, so
+// the fill controller, jitter estimate, drop-oldest and slow-convergence logic
+// are reused unchanged.
+function onDecodedAudio(data) {
+  try {
+    const n = data.numberOfFrames;
+    const ch = data.numberOfChannels;
+    const arr = new Int16Array(n * ch);
+    try {
+      data.copyTo(arr, { planeIndex: 0, format: 's16' });
+    } catch (_) {
+      // Some builds only expose planar f32 copyTo; interleave by hand.
+      for (let c = 0; c < ch; c++) {
+        const plane = new Float32Array(n);
+        data.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
+        for (let i = 0; i < n; i++) {
+          const s = Math.max(-1, Math.min(1, plane[i]));
+          arr[i * ch + c] = s < 0 ? s * 32768 : s * 32767;
+        }
+      }
+    }
+    const flags = opusDiscPending ? 1 : 0;
+    opusDiscPending = false;
+    if (node) node.port.postMessage({ type: 'frame', seq: opusSeq, flags, frames: arr }, [arr.buffer]);
+  } finally {
+    data.close();
+  }
+}
+
+function handleOpusMessage(buf) {
+  const u8 = new Uint8Array(buf);
+  if (u8.length === 0) return;
+  // CONFIG is first-byte 0x02 followed by OpusHead. An AUDIO message's 13-byte
+  // header also starts with the packet seq, whose low byte can be 0x02, so the
+  // OpusHead magic is required to disambiguate.
+  const isOpusHead = u8.length >= 9 && u8[1] === 0x4f && u8[2] === 0x70 && u8[3] === 0x75 &&
+    u8[4] === 0x73 && u8[5] === 0x48 && u8[6] === 0x65 && u8[7] === 0x61 && u8[8] === 0x64;
+  if (u8[0] === 0x02 && isOpusHead) {
+    if (typeof AudioDecoder === 'undefined') {
+      log('got Opus CONFIG but AudioDecoder is unavailable; cannot decode');
+      return;
+    }
+    if (!decoder) {
+      decoder = new AudioDecoder({
+        output: onDecodedAudio,
+        error: (e) => log('opus decoder error: ' + e.message),
+      });
+    }
+    const head = new Uint8Array(buf, 1);
+    try {
+      decoder.configure({ codec: 'opus', sampleRate: RATE, numberOfChannels: CHANNELS, description: head });
+      log(`opus decoder configured (${head.length} B OpusHead, ${RATE} Hz, ${CHANNELS} ch)`);
+    } catch (e) {
+      log('opus configure failed: ' + e.message);
+    }
+    return;
+  }
+  if (buf.byteLength === 5 && u8[0] === 0x01) {
+    const seq = new DataView(buf).getUint32(1, true);
+    node.port.postMessage({ type: 'ctrl', seq });
+    return;
+  }
+  if (buf.byteLength > 13) { // 13-byte header + one raw Opus packet
+    const view = new DataView(buf);
+    opusSeq = view.getUint32(0, true);
+    if (view.getUint8(12) & 1) opusDiscPending = true;
+    if (decoder && decoder.state === 'configured') {
+      decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: 0, data: new Uint8Array(buf, 13) }));
+    }
+  }
+}
+
+function handlePcmMessage(buf) {
+  if (buf.byteLength === MSG_BYTES) {
+    const view = new DataView(buf);
+    const seq = view.getUint32(0, true);
+    const flags = view.getUint8(12);
+    const arr = new Int16Array(FRAME_BYTES / 2);
+    new Uint8Array(arr.buffer).set(new Uint8Array(buf, 13, FRAME_BYTES));
+    node.port.postMessage({ type: 'frame', seq, flags, frames: arr }, [arr.buffer]);
+  } else if (buf.byteLength === 5 && new Uint8Array(buf)[0] === 0x01) {
+    const seq = new DataView(buf).getUint32(1, true);
+    node.port.postMessage({ type: 'ctrl', seq });
+  }
 }
 
 function connect() {
@@ -315,17 +435,8 @@ function connect() {
   ws.onerror = () => log('ws error');
   ws.onmessage = (ev) => {
     const buf = ev.data;
-    if (buf.byteLength === MSG_BYTES) {
-      const view = new DataView(buf);
-      const seq = view.getUint32(0, true);
-      const flags = view.getUint8(12);
-      const arr = new Int16Array(FRAME_BYTES / 2);
-      new Uint8Array(arr.buffer).set(new Uint8Array(buf, 13, FRAME_BYTES));
-      node.port.postMessage({ type: 'frame', seq, flags, frames: arr }, [arr.buffer]);
-    } else if (buf.byteLength === 5 && new Uint8Array(buf)[0] === 0x01) {
-      const seq = new DataView(buf).getUint32(1, true);
-      node.port.postMessage({ type: 'ctrl', seq });
-    }
+    if (CODEC === 'opus') handleOpusMessage(buf);
+    else handlePcmMessage(buf);
   };
 }
 

@@ -72,8 +72,9 @@ Schema mirror: each field is `key: value` with a single space, so
 ## Outputs
 
 One capture feeds N outputs; each is enabled in config and togglable at
-runtime. `ws-pcm` (the browser WS/PCM path) is on by default; `icecast` and
-`hls` are off by default and cost nothing until enabled (no process spawned).
+runtime. `ws-pcm` (the browser WS/PCM path) is on by default; `icecast`,
+`hls` and `ws-opus` are off by default and cost nothing until enabled (no
+process spawned).
 
 ```json
 {
@@ -87,7 +88,8 @@ runtime. `ws-pcm` (the browser WS/PCM path) is on by default; `icecast` and
     "hls": {
       "enabled": false, "dir": "/tmp/tidal-stream-hls",
       "segmentMs": 2000, "listSize": 6, "bitrate": 128, "codec": "aac"
-    }
+    },
+    "ws-opus": { "enabled": false, "bitrate": 96 }
   }
 }
 ```
@@ -103,13 +105,22 @@ runtime. `ws-pcm` (the browser WS/PCM path) is on by default; `icecast` and
   into `dir`, served by streamd at `/hls/index.m3u8` (playlist no-store). Open
   in a browser with an HLS-capable player (Safari natively, or a page using
   hls.js) at `http://<host>:8787/hls/index.m3u8`.
+- **ws-opus** — `ws-opus.mjs` spawns ffmpeg reading s16le PCM on stdin and
+  writing an Ogg/Opus bitstream to stdout, parses that Ogg bitstream back into
+  raw Opus packets, and fans them out over a WebSocket on the daemon's own
+  port at path **`/opus`** (ws-pcm keeps `/`). It is the bandwidth-thin path
+  for **our** player (~96 kbps vs ~1.5 Mbps for s16le stereo PCM); it is NOT a
+  replacement for icecast, which exists for third-party players (VLC, phones)
+  that cannot speak this protocol. `bitrate` sets libopus `-b:a` (default 96).
+  Same drop-oldest anti-drift rule as ws-pcm (at most 2 packets per
+  connection). See *Opus path* below.
 
 Runtime toggle (no restart — the capture and the other outputs keep running):
 
 ```sh
 tools/stream/stream-ctl output on icecast
 tools/stream/stream-ctl output off icecast
-tools/stream/stream-ctl output on hls
+tools/stream/stream-ctl output on ws-opus
 tools/stream/stream-ctl outputs      # name enabled active listeners dropped bytesOut error
 ```
 
@@ -131,6 +142,35 @@ One WS message = one frame, 3853 bytes, all integers little-endian:
 Server queue per connection: **at most 2 frames, drop-oldest**. A slow reader
 loses audio, never latency. A 1-byte client ping is answered with a 5-byte
 control frame `[0x01, uint32 seq LE]`.
+
+### Opus path (`/opus`, `?codec=opus`)
+
+The `ws-opus` output reuses the same 13-byte header but replaces the PCM
+payload with one raw Opus packet, and adds one control message:
+
+| message | bytes | meaning |
+|---|---|---|
+| CONFIG | `0x02` + raw OpusHead | sent once when a client connects and again whenever ffmpeg (re)starts; the OpusHead is `AudioDecoderConfig.description` for WebCodecs |
+| AUDIO | 13-byte header + one Opus packet | same header layout as PCM (`seq` is the output's own packet seq) |
+| ping reply | `[0x01, uint32 seq LE]` | unchanged, `seq` is the current packet seq |
+
+Open the player with `?codec=opus` to force the Opus path; otherwise the page
+auto-selects Opus when ws-pcm is inactive and ws-opus is active (and falls back
+to PCM when the browser has no `AudioDecoder`). The pmode line shows the codec
+in use. The Opus path is decoded with WebCodecs (`AudioDecoder`) and converted
+to interleaved s16, then fed to the SAME AudioWorklet frame message as PCM, so
+the fill controller, jitter estimate, drop-oldest and slow-convergence logic
+are reused unchanged.
+
+**Browser caveat:** WebCodecs `AudioDecoder` support for Opus is required
+(Chrome/Edge and Safari 16.4+ expose it; Firefox does not as of this writing).
+When it is missing the page logs it and uses the PCM path — it never silently
+plays nothing.
+
+**How it differs from icecast:** icecast pushes Ogg/Opus to an external Icecast
+server for any third-party player (VLC, a phone browser); `ws-opus` speaks our
+own WS framing on streamd's port and is consumed by `player.html`. icecast is
+for interoperability, ws-opus is for our low-bandwidth player.
 
 ### Capture binding (required property)
 
