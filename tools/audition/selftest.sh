@@ -27,8 +27,13 @@ case "$status_out" in
   *) echo "SKIP: audition stack not running — run 'audition-ctl start'"; exit 2 ;;
 esac
 
-# live-stack log baseline (must be untouched by any audition job)
-before="$(stat -c '%n %Y' "$LIVE_SC"/*.log 2>/dev/null)"
+# Live-stack log baseline (must be untouched by any audition job).
+# master-meter.log is deliberately EXCLUDED: the live stack's own ceiling meter
+# rewrites it every 2s while it runs, so its mtime proves nothing either way.
+# Including it made this check flaky - it passed only when the live stack was
+# idle. (Verified: with no audition job running the file still grows ~165 B/6s.)
+LIVE_LOGS="$LIVE_SC/boot.log $LIVE_SC/engine.log $LIVE_SC/spectrum.log $LIVE_SC/ctl.log $LIVE_SC/state.scd"
+before="$(stat -c '%n %Y %s' $LIVE_LOGS 2>/dev/null)"
 
 # poll a job to a terminal state (report exits 0) with a timeout
 wait_terminal() { # <id> <timeout_s>
@@ -73,12 +78,27 @@ if wait_terminal "$bid" 90; then ok "broken scene reached a terminal report"; el
 [ -n "$(field "['error']")" ] && ok "broken scene carries an error message" || bad "broken scene has no error"
 rm -f "$broken"
 
-echo "=== 3. jobs ==="
+echo "=== 3. non-zero channel slot measures signal ==="
+# The scene mixer installs with gains [1,0,...]. If the runner does not raise the
+# slot under test, slots 1+ render into a MUTED channel and the job reports
+# all-zero metrics as ok:true - a false "this deck is silent" verdict. Testing
+# only slot 0 hid that; audit into a real destination slot here.
+sid="$("$CTL" submit "$SCENE" --slot 1 --cycles 4)"
+if wait_terminal "$sid" 180; then ok "slot-1 job reached a terminal report"; else bad "slot-1 job did not finish"; fi
+s1="$(python3 -c "import json;r=json.load(open('/tmp/selftest-report.json'));b=r['bands'];print('measured' if abs(sum(b.values())-1.0)<1e-3 else 'silent')" 2>/dev/null)"
+[ "$s1" = "measured" ] && ok "slot 1 measured real bands" || bad "slot 1 measured NO signal (bands do not sum to 1) - the slot gain was never raised"
+
+# a second job that also proved the live snapshot is consulted
+python3 -c "import json;r=json.load(open('/tmp/selftest-report.json'));assert 'available' in r['diffVsLive']" 2>/dev/null && ok "slot-1 report carries diffVsLive" || bad "slot-1 report has no diffVsLive"
+
+echo "=== 4. jobs ==="
 "$CTL" jobs --limit 5
 
-echo "=== 4. live stack untouched ==="
-after="$(stat -c '%n %Y' "$LIVE_SC"/*.log 2>/dev/null)"
-[ "$before" = "$after" ] && ok "live sc/*.log mtimes unchanged" || bad "live sc logs changed: $before -> $after"
+echo "=== 5. live stack untouched ==="
+after="$(stat -c '%n %Y %s' $LIVE_LOGS 2>/dev/null)"
+[ "$before" = "$after" ] && ok "live boot/engine/spectrum/ctl/state unchanged" || bad "live sc files changed: $before -> $after"
+# Positive check: the audition wrote its OWN private graph log instead.
+if [ -s "/home/erik/livecode/sc/audition/boot.log" ]; then ok "audition wrote its own private graph log"; else bad "audition private graph log missing/empty"; fi
 
 echo
 echo "selftest: $pass passed, $fail failed"

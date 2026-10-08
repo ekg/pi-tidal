@@ -320,6 +320,11 @@ Routine({
 		while { (~piSceneManager.notNil and: { ~piSceneManager[\\installed].not }) and: { Main.elapsedTime < deadline } } { 0.1.wait };
 		if(~piSceneManager.isNil or: { ~piSceneManager[\\installed].not }) { Error("scene runtime install timed out").throw };
 		if(~piSceneManager[\\buses][${job.slot}].isNil) { Error("no scene channel bus for slot ${job.slot}").throw };
+		// Unmute ONLY the slot under test. The scene mixer installs with gains
+		// [1,0,...], so without this any slot but 0 renders into a MUTED channel
+		// and the job reports all-zero metrics as ok:true - a false "this deck is
+		// silent" verdict for exactly the slots worth auditioning into.
+		~piSceneAPI[\\gains].value(Array.fill(${CHANNELS}, { |i| if(i == ${job.slot}) { 1 } { 0 } }), 0.02);
 		indices = [~masterBus.index, ~piSceneManager[\\buses][${job.slot}].index];
 		~auditionMeterStart.value(["master", "ch${job.slot}"], indices, 1.5, 0.25);
 		File.use(ready, "w", { |f| f.write("ready") });
