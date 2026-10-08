@@ -140,6 +140,45 @@ do_status() {
   echo "source: $source"
   echo "daemon: $daemon"
   echo "enabled: $(cfg enabled false)"
+  if [ -n "$js" ] && command -v jq >/dev/null 2>&1; then
+    jq -r '.outputs[]? | "output: \(.name) enabled=\(.enabled) active=\(.active)" + (if (.listeners|type)=="number" then " listeners=\(.listeners)" else "" end)' <<<"$js"
+  fi
+}
+
+# Toggle one output live over POST /control (no restart: the capture and the
+# other outputs keep running). Falls back to editing config when the daemon is
+# down, so the choice still takes effect on next start.
+do_output() { # on|off <name>
+  local act="${1:-}" name="${2:-}"
+  case "$act" in on|off) ;; *) echo "usage: $0 output on|off <name>" >&2; exit 2 ;; esac
+  [ -n "$name" ] || { echo "usage: $0 output on|off <name>" >&2; exit 2; }
+  local js; js="$(daemon_status_json)"
+  if [ -n "$js" ]; then
+    local code
+    code="$(curl -s -o /tmp/stream-ctl-control.out -w '%{http_code}' -X POST \
+      -H 'Content-Type: application/json' \
+      -d "{\"output\":\"$name\",\"action\":\"$act\"}" \
+      "http://127.0.0.1:${PORT}/control?token=${TOKEN}" 2>/dev/null)"
+    if [ "$code" = "200" ]; then echo "output $name $act: ok (live)"; return; fi
+    echo "output $name $act: daemon refused (http ${code:-none})" >&2
+    [ -s /tmp/stream-ctl-control.out ] && cat /tmp/stream-ctl-control.out >&2
+    exit 1
+  fi
+  mkdir -p "$CONFIG_DIR"
+  [ -f "$CONFIG" ] || write_default_config false
+  local val; [ "$act" = on ] && val=true || val=false
+  local tmp; tmp="$(mktemp)"
+  jq --arg n "$name" --argjson v "$val" \
+    '.outputs = (.outputs // {}) | .outputs[$n] = ((.outputs[$n] // {}) + {enabled: $v})' \
+    "$CONFIG" > "$tmp" && mv "$tmp" "$CONFIG"
+  echo "output $name $act: recorded in config (daemon not running)"
+}
+
+do_outputs() {
+  local js; js="$(daemon_status_json)"
+  if [ -z "$js" ]; then echo "daemon: down (no live output state)"; return; fi
+  if ! command -v jq >/dev/null 2>&1; then echo "$js"; return; fi
+  jq -r '.outputs[]? | "\(.name)\tenabled=\(.enabled)\tactive=\(.active)" + (if (.listeners|type)=="number" then "\tlisteners=\(.listeners)" else "" end) + (if (.dropped|type)=="number" then "\tdropped=\(.dropped)" else "" end)' <<<"$js"
 }
 
 do_url() {
@@ -168,8 +207,10 @@ case "${1:-}" in
   stop)    do_stop ;;
   status)  do_status ;;
   url)     do_url ;;
+  output)  do_output "${2:-}" "${3:-}" ;;
+  outputs) do_outputs ;;
   *)
-    echo "usage: $0 enable|disable|start|stop|status|url" >&2
+    echo "usage: $0 enable|disable|start|stop|status|url|output on|off <name>|outputs" >&2
     exit 2
     ;;
 esac

@@ -1,10 +1,18 @@
 #!/usr/bin/env node
-// streamd — low-latency audio stream daemon (lane 1).
+// streamd — low-latency audio stream daemon (lane 1; fan-out refactor).
 //
-// Reads a raw s16le stereo PCM stream from `pw-record --target <sink> -`,
-// slices it into fixed 20 ms frames, and broadcasts each frame to WebSocket
-// clients with the exact framing frozen in docs/stream-audition.md.
+// SOURCE: one `pw-record --target <sink> -` capture (raw s16le stereo PCM),
+// sliced into fixed 20 ms frames.
+// SINKS: N pluggable OUTPUTS, each independently enabled in config and
+// togglable at runtime over POST /control. Every output receives the same
+// frames; an output that falls behind affects only its own consumers.
 //
+//   pw-record --> [ frame ] --> ws-pcm   (this file; always the low-latency path)
+//                         \--> icecast  (lane 5: ffmpeg -> external icecast)
+//                          \-> hls      (lane 5: ffmpeg -> segments on /hls/)
+//                          \-> ws-opus  (lane 5: ffmpeg -> WS, WebCodecs)
+//
+// Frame framing (frozen in docs/stream-audition.md):
 //   offset 0  uint32   seq      (LE, wraps at 2^32)
 //   offset 4  float64  sentMs   (LE, server Date.now() at read)
 //   offset 12 uint8    flags    bit0 = discontinuity
@@ -15,8 +23,9 @@
 // client->server traffic is WS control frames plus an optional 1-byte ping
 // which is answered with a 5-byte control frame [0x01, uint32 seq LE].
 //
-// Anti-drift: each connection holds at most 2 frames, drop-oldest. A slow
-// reader loses audio; it never accumulates latency.
+// Anti-drift (ws-pcm only): each connection holds at most 2 frames,
+// drop-oldest. A slow reader loses audio; it never accumulates latency. The
+// capture itself is NEVER dropped — only the per-output queue is bounded.
 //
 // Watchdog: if pw-record yields no bytes for > 500 ms the capture is killed and
 // restarted, and the next emitted frame sets flags bit0 (discontinuity). The
@@ -53,19 +62,31 @@ const DEFAULTS = {
   frameMs: 20,
   sink: 'tidal_stream',
   sourceNode: 'tidal_stream',
+  // Per-output state. Missing entry => the output's own default. ws-pcm is on
+  // by default so behaviour matches pre-refactor streamd; everything else is
+  // opt-in. bind/port/token above remain ws-pcm's (and the control/status
+  // server's) settings, kept at top level for backward compatibility.
+  outputs: {},
 };
 
 const CONFIG_PATH =
   process.env.PI_TIDAL_STREAM_CONFIG ||
   path.join(os.homedir(), '.config', 'tidal-stream', 'config.json');
 
-function loadConfig() {
-  const cfg = { ...DEFAULTS };
+function readConfigFile() {
   try {
-    Object.assign(cfg, JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')));
+    return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
   } catch (e) {
     if (e.code !== 'ENOENT') log(`config read error (${CONFIG_PATH}): ${e.message}`);
+    return {};
   }
+}
+
+function loadConfig() {
+  const cfg = { ...DEFAULTS, outputs: {} };
+  const file = readConfigFile();
+  Object.assign(cfg, file);
+  cfg.outputs = { ...(file.outputs || {}) };
   const env = (k) => process.env[`PI_TIDAL_STREAM_${k}`];
   const num = (k, cur) => {
     const v = env(k);
@@ -98,16 +119,58 @@ const BIND = cfg.bind;
 const TOKEN = cfg.token || '';
 const SINK = cfg.sink;
 
-// --- state -----------------------------------------------------------------
+// Persist the runtime output state, preserving every other key in the file.
+function persistOutputEnabled(name, enabled) {
+  const file = readConfigFile();
+  file.outputs = { ...(file.outputs || {}) };
+  file.outputs[name] = { ...(file.outputs[name] || {}), enabled };
+  try {
+    fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(file, null, 2) + '\n');
+    return true;
+  } catch (e) {
+    log(`could not persist output state to ${CONFIG_PATH}: ${e.message}`);
+    return false;
+  }
+}
+
+// --- source-level state ----------------------------------------------------
 let seq = 0;
 let pendingDiscontinuity = false;
-let listenerCount = 0;
-let droppedTotal = 0;
 let frameCounter = 0; // frames emitted since last fps window
 let fpsWindowStart = Date.now();
 let framesPerSec = 0;
 
-const connections = new Set();
+// --- output registry -------------------------------------------------------
+// An output is a plain object:
+//   name                      stable id, also the config key
+//   settings                  merged config for this output
+//   active                    true while started
+//   start() / stop()          idempotent; must not throw
+//   onFrame(msg)              called once per emitted frame while active
+//   handleHttp(url, req, res) return true when the route was handled
+//   handleUpgrade(url, req, socket) return true when the upgrade was handled
+//   status()                  {name, enabled, active, ...extras}
+const outputs = new Map();
+
+function registerOutput(out) {
+  outputs.set(out.name, out);
+  return out;
+}
+
+function outputSettings(name, defaults = {}) {
+  return { enabled: true, ...defaults, ...(cfg.outputs?.[name] || {}) };
+}
+
+function activeOutputs() {
+  const list = [];
+  for (const out of outputs.values()) if (out.active) list.push(out);
+  return list;
+}
+
+function enabledOutputNames() {
+  return [...outputs.values()].filter((o) => o.active).map((o) => o.name);
+}
 
 // --- capture ---------------------------------------------------------------
 //
@@ -259,6 +322,8 @@ async function verifyCaptureLinkage() {
   }
 }
 
+// Build ONE frame and hand the same buffer to every active output. The source
+// is never dropped; per-output queueing is each output's own business.
 function emitFrame(payload) {
   seq = (seq + 1) >>> 0;
   const flags = pendingDiscontinuity ? 1 : 0;
@@ -271,7 +336,14 @@ function emitFrame(payload) {
   payload.copy(msg, 13);
 
   frameCounter++;
-  for (const conn of connections) enqueue(conn, msg);
+  for (const out of outputs.values()) {
+    if (!out.active) continue;
+    try {
+      out.onFrame(msg);
+    } catch (e) {
+      log(`output '${out.name}' onFrame threw: ${e.message}`);
+    }
+  }
 }
 
 // watchdog: no bytes for > 500 ms while a capture process is alive
@@ -295,135 +367,225 @@ setInterval(() => {
   verifyCaptureLinkage();
 }, 2000).unref();
 
-// --- WebSocket protocol ----------------------------------------------------
+// ===========================================================================
+// OUTPUT: ws-pcm — the low-latency WebSocket/PCM path (the built-in one).
+// Owns its connections and the bounded drop-oldest queue. Serves the player
+// page on `/`.
+// ===========================================================================
+function createWsPcmOutput() {
+  const settings = outputSettings('ws-pcm', {});
+  const connections = new Set();
+  let droppedTotal = 0;
+
+  function wsEncode(payload) {
+    const len = payload.length;
+    let header;
+    if (len < 126) {
+      header = Buffer.allocUnsafe(2);
+      header[0] = 0x82;
+      header[1] = len;
+    } else if (len < 65536) {
+      header = Buffer.allocUnsafe(4);
+      header[0] = 0x82;
+      header[1] = 126;
+      header.writeUInt16BE(len, 2);
+    } else {
+      header = Buffer.allocUnsafe(10);
+      header[0] = 0x82;
+      header[1] = 127;
+      header.writeBigUInt64BE(BigInt(len), 2);
+    }
+    return Buffer.concat([header, payload]);
+  }
+
+  function closeConn(conn) {
+    if (conn.closed) return;
+    conn.closed = true;
+    connections.delete(conn);
+    try {
+      conn.socket.destroy();
+    } catch {}
+  }
+
+  function pump(conn) {
+    if (conn.writing || conn.closed) return;
+    const msg = conn.queue.shift();
+    if (!msg) return;
+    conn.writing = true;
+    try {
+      conn.socket.write(wsEncode(msg), () => {
+        conn.writing = false;
+        pump(conn);
+      });
+    } catch {
+      conn.writing = false;
+      closeConn(conn);
+    }
+  }
+
+  // the core anti-drift rule: at most 2 frames queued, drop-oldest
+  function enqueue(conn, msg) {
+    conn.queue.push(msg);
+    while (conn.queue.length > 2) {
+      conn.queue.shift();
+      conn.dropped++;
+      droppedTotal++;
+    }
+    pump(conn);
+  }
+
+  function sendControl(conn, opcode, payload) {
+    const header = Buffer.allocUnsafe(2);
+    header[0] = 0x80 | opcode;
+    header[1] = payload.length;
+    try {
+      conn.socket.write(Buffer.concat([header, payload]));
+    } catch {}
+  }
+
+  function handleClientFrame(conn, opcode, payload) {
+    if (opcode === 0x8) return closeConn(conn);
+    if (opcode === 0x9) return sendControl(conn, 0xa, payload); // pong
+    if (opcode === 0xa) return;
+    // data frame: a 1-byte ping asks for the current seq (explicit resync)
+    if (payload.length === 1) {
+      const p = Buffer.allocUnsafe(5);
+      p.writeUInt8(0x01, 0);
+      p.writeUInt32LE(seq, 1);
+      sendControl(conn, 0x2, p);
+    }
+  }
+
+  function onSocketData(conn, chunk) {
+    conn.rbuf = conn.rbuf.length ? Buffer.concat([conn.rbuf, chunk]) : chunk;
+    for (;;) {
+      const b = conn.rbuf;
+      if (b.length < 2) break;
+      const opcode = b[0] & 0x0f;
+      const masked = (b[1] & 0x80) !== 0;
+      let len = b[1] & 0x7f;
+      let off = 2;
+      if (len === 126) {
+        if (b.length < 4) break;
+        len = b.readUInt16BE(2);
+        off = 4;
+      } else if (len === 127) {
+        if (b.length < 10) break;
+        len = Number(b.readBigUInt64BE(2));
+        off = 10;
+      }
+      const maskLen = masked ? 4 : 0;
+      if (b.length < off + maskLen + len) break;
+      let payload;
+      if (masked) {
+        const mask = b.subarray(off, off + 4);
+        payload = Buffer.allocUnsafe(len);
+        for (let i = 0; i < len; i++) payload[i] = b[off + 4 + i] ^ mask[i & 3];
+      } else {
+        payload = b.subarray(off, off + len);
+      }
+      conn.rbuf = b.subarray(off + maskLen + len);
+      handleClientFrame(conn, opcode, payload);
+      if (conn.closed) break;
+    }
+  }
+
+  return registerOutput({
+    name: 'ws-pcm',
+    settings,
+    active: false,
+    async start() {
+      if (this.active) return;
+      this.active = true;
+      log(`output ws-pcm started (listeners=${connections.size})`);
+    },
+    async stop() {
+      if (!this.active) return;
+      for (const conn of [...connections]) closeConn(conn);
+      this.active = false;
+      log('output ws-pcm stopped (listeners closed)');
+    },
+    onFrame(msg) {
+      for (const conn of connections) enqueue(conn, msg);
+    },
+    handleHttp(url, req, res) {
+      if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/player.html')) {
+        try {
+          const html = fs.readFileSync(path.join(HERE, 'player.html'));
+          res.writeHead(200, {
+            'Content-Type': 'text/html; charset=utf-8',
+            'Cache-Control': 'no-store',
+          });
+          res.end(html);
+        } catch {
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('player.html not found\n');
+        }
+        return true;
+      }
+      return false;
+    },
+    handleUpgrade(url, req, socket) {
+      if (url.pathname !== '/') return false;
+      if (!this.active) {
+        socket.end('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+        return true;
+      }
+      const key = req.headers['sec-websocket-key'];
+      if (!key || req.headers['upgrade']?.toLowerCase() !== 'websocket') {
+        socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+        return true;
+      }
+      socket.write(
+        'HTTP/1.1 101 Switching Protocols\r\n' +
+          'Upgrade: websocket\r\n' +
+          'Connection: Upgrade\r\n' +
+          `Sec-WebSocket-Accept: ${acceptKey(key)}\r\n\r\n`,
+      );
+      socket.setNoDelay(true);
+      const conn = { socket, queue: [], writing: false, closed: false, dropped: 0, rbuf: Buffer.alloc(0) };
+      connections.add(conn);
+      log(`client connected (listeners=${connections.size})`);
+
+      socket.on('data', (chunk) => onSocketData(conn, chunk));
+      socket.on('error', () => closeConn(conn));
+      socket.on('close', () => {
+        if (!conn.closed) log(`client disconnected (dropped=${conn.dropped})`);
+        closeConn(conn);
+      });
+      return true;
+    },
+    status() {
+      return {
+        name: 'ws-pcm',
+        enabled: settings.enabled !== false,
+        active: this.active,
+        listeners: connections.size,
+        dropped: droppedTotal,
+      };
+    },
+  });
+}
+
 function acceptKey(key) {
   return crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
 }
 
-function wsEncode(payload) {
-  const len = payload.length;
-  let header;
-  if (len < 126) {
-    header = Buffer.allocUnsafe(2);
-    header[0] = 0x82;
-    header[1] = len;
-  } else if (len < 65536) {
-    header = Buffer.allocUnsafe(4);
-    header[0] = 0x82;
-    header[1] = 126;
-    header.writeUInt16BE(len, 2);
-  } else {
-    header = Buffer.allocUnsafe(10);
-    header[0] = 0x82;
-    header[1] = 127;
-    header.writeBigUInt64BE(BigInt(len), 2);
-  }
-  return Buffer.concat([header, payload]);
-}
+const wsPcm = createWsPcmOutput();
 
-function enqueue(conn, msg) {
-  conn.queue.push(msg);
-  while (conn.queue.length > 2) {
-    conn.queue.shift();
-    conn.dropped++;
-    droppedTotal++;
-  }
-  pump(conn);
-}
-
-function pump(conn) {
-  if (conn.writing || conn.closed) return;
-  const msg = conn.queue.shift();
-  if (!msg) return;
-  conn.writing = true;
-  try {
-    conn.socket.write(wsEncode(msg), () => {
-      conn.writing = false;
-      pump(conn);
-    });
-  } catch (e) {
-    conn.writing = false;
-    closeConn(conn);
-  }
-}
-
-function closeConn(conn) {
-  if (conn.closed) return;
-  conn.closed = true;
-  connections.delete(conn);
-  listenerCount = connections.size;
-  try {
-    conn.socket.destroy();
-  } catch {}
-}
-
-function sendControl(conn, opcode, payload) {
-  const len = payload.length;
-  const header = Buffer.allocUnsafe(2);
-  header[0] = 0x80 | opcode;
-  header[1] = len;
-  try {
-    conn.socket.write(Buffer.concat([header, payload]));
-  } catch {}
-}
-
-function handleClientFrame(conn, opcode, payload) {
-  if (opcode === 0x8) {
-    closeConn(conn);
-    return;
-  }
-  if (opcode === 0x9) {
-    sendControl(conn, 0xa, payload); // pong
-    return;
-  }
-  if (opcode === 0xa) return;
-  // data frame: a 1-byte ping asks for the current seq (explicit resync)
-  if (payload.length === 1) {
-    const p = Buffer.allocUnsafe(5);
-    p.writeUInt8(0x01, 0);
-    p.writeUInt32LE(seq, 1);
-    sendControl(conn, 0x2, p);
-  }
-}
-
-function onSocketData(conn, chunk) {
-  conn.rbuf = conn.rbuf.length ? Buffer.concat([conn.rbuf, chunk]) : chunk;
-  for (;;) {
-    const b = conn.rbuf;
-    if (b.length < 2) break;
-    const opcode = b[0] & 0x0f;
-    const masked = (b[1] & 0x80) !== 0;
-    let len = b[1] & 0x7f;
-    let off = 2;
-    if (len === 126) {
-      if (b.length < 4) break;
-      len = b.readUInt16BE(2);
-      off = 4;
-    } else if (len === 127) {
-      if (b.length < 10) break;
-      len = Number(b.readBigUInt64BE(2));
-      off = 10;
-    }
-    const maskLen = masked ? 4 : 0;
-    if (b.length < off + maskLen + len) break;
-    let payload;
-    if (masked) {
-      const mask = b.subarray(off, off + 4);
-      payload = Buffer.allocUnsafe(len);
-      for (let i = 0; i < len; i++) payload[i] = b[off + 4 + i] ^ mask[i & 3];
-    } else {
-      payload = b.subarray(off, off + len);
-    }
-    conn.rbuf = b.subarray(off + maskLen + len);
-    handleClientFrame(conn, opcode, payload);
-    if (conn.closed) break;
-  }
-}
-
-// --- HTTP + upgrade --------------------------------------------------------
+// ===========================================================================
+// HTTP server: shared transport for /status, /control and every output's own
+// routes. Outputs attach by returning true from handleHttp/handleUpgrade.
+// ===========================================================================
 function isLoopback(req) {
   const a = req.socket.remoteAddress || '';
   return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
+}
+
+function authorized(req, url) {
+  if (!TOKEN) return true;
+  if (isLoopback(req)) return true;
+  return url.searchParams.get('token') === TOKEN;
 }
 
 function statusPayload() {
@@ -439,37 +601,59 @@ function statusPayload() {
     sourceNode: cfg.sourceNode,
     captureAlive,
     lastByteAgeMs: captureAlive ? now - lastByteAt : null,
-    listeners: listenerCount,
+    listeners: wsPcm.status().listeners,
     framesPerSec,
-    dropped: droppedTotal,
+    dropped: wsPcm.status().dropped,
     seq,
     frameMs: FRAME_MS,
     rate: RATE,
     channels: CHANNELS,
     source: sourceUp ? 'up' : 'down',
+    outputs: [...outputs.values()].map((o) => o.status()),
     pid: process.pid,
   };
 }
 
-function servePlayer(res) {
-  try {
-    const html = fs.readFileSync(path.join(HERE, 'player.html'));
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-    res.end(html);
-  } catch (e) {
-    res.writeHead(404, { 'Content-Type': 'text/plain' });
-    res.end('player.html not found\n');
+async function setOutput(name, action, persist) {
+  const out = outputs.get(name);
+  if (!out) return { ok: false, error: `unknown output '${name}'`, outputs: [...outputs.keys()] };
+  if (action === 'on') {
+    out.settings.enabled = true;
+    await out.start();
+  } else if (action === 'off') {
+    out.settings.enabled = false;
+    await out.stop();
+  } else {
+    return { ok: false, error: `unknown action '${action}' (on|off)` };
   }
+  if (persist) persistOutputEnabled(name, out.settings.enabled);
+  log(`output ${name} ${action} (active=${out.active})`);
+  return { ok: true, output: out.status() };
 }
 
-const server = http.createServer((req, res) => {
+function readJsonBody(req, limit = 65536) {
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+      if (body.length > limit) req.destroy();
+    });
+    req.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch {
+        resolve(null);
+      }
+    });
+    req.on('error', () => resolve(null));
+  });
+}
+
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
-  if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/player.html')) {
-    servePlayer(res);
-    return;
-  }
+
   if (req.method === 'GET' && url.pathname === '/status') {
-    if (TOKEN && !isLoopback(req) && url.searchParams.get('token') !== TOKEN) {
+    if (!authorized(req, url)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
       return;
@@ -478,65 +662,67 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(statusPayload()));
     return;
   }
+
+  if (req.method === 'POST' && url.pathname === '/control') {
+    if (!authorized(req, url)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+      return;
+    }
+    const body = await readJsonBody(req);
+    if (!body || !body.output || !body.action) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'expected {"output":"<name>","action":"on|off"}' }));
+      return;
+    }
+    const result = await setOutput(String(body.output), String(body.action), body.persist !== false);
+    res.writeHead(result.ok ? 200 : 404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ...result, status: statusPayload() }));
+    return;
+  }
+
+  // outputs' own HTTP routes (hls segments/playlist, …)
+  for (const out of outputs.values()) {
+    if (typeof out.handleHttp === 'function' && out.handleHttp(url, req, res)) return;
+  }
+
   res.writeHead(404, { 'Content-Type': 'text/plain' });
   res.end('not found\n');
 });
 
 server.on('upgrade', (req, socket) => {
   const url = new URL(req.url, 'http://localhost');
-  if (url.pathname !== '/') {
-    socket.end('HTTP/1.1 404 Not Found\r\n\r\n');
-    return;
-  }
-  if (TOKEN && url.searchParams.get('token') !== TOKEN) {
+  if (!authorized(req, url)) {
     socket.end('HTTP/1.1 401 Unauthorized\r\n\r\n');
     return;
   }
-  const key = req.headers['sec-websocket-key'];
-  if (!key || req.headers['upgrade']?.toLowerCase() !== 'websocket') {
-    socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
-    return;
+  for (const out of outputs.values()) {
+    if (typeof out.handleUpgrade === 'function' && out.handleUpgrade(url, req, socket)) return;
   }
-  socket.write(
-    'HTTP/1.1 101 Switching Protocols\r\n' +
-      'Upgrade: websocket\r\n' +
-      'Connection: Upgrade\r\n' +
-      `Sec-WebSocket-Accept: ${acceptKey(key)}\r\n\r\n`,
-  );
-  socket.setNoDelay(true);
-  const conn = {
-    socket,
-    queue: [],
-    writing: false,
-    closed: false,
-    dropped: 0,
-    rbuf: Buffer.alloc(0),
-  };
-  connections.add(conn);
-  listenerCount = connections.size;
-  log(`client connected (listeners=${listenerCount})`);
-
-  socket.on('data', (chunk) => onSocketData(conn, chunk));
-  socket.on('error', () => closeConn(conn));
-  socket.on('close', () => {
-    if (!conn.closed) log(`client disconnected (dropped=${conn.dropped})`);
-    closeConn(conn);
-  });
+  socket.end('HTTP/1.1 404 Not Found\r\n\r\n');
 });
 
-server.on('error', (e) => {
-  log(`server error: ${e.message}`);
-});
+server.on('error', (e) => log(`server error: ${e.message}`));
 
-server.listen(PORT, BIND, () => {
+server.listen(PORT, BIND, async () => {
   log(`listening on ${BIND}:${PORT} (sink=${SINK}, frameBytes=${FRAME_BYTES})`);
+  // start the outputs whose config says enabled (ws-pcm defaults to on)
+  for (const out of outputs.values()) {
+    if (out.settings.enabled !== false) await out.start();
+    else log(`output '${out.name}' disabled in config (toggle with POST /control)`);
+  }
+  log(`outputs active: ${enabledOutputNames().join(', ') || '(none)'}`);
   startCaptureOnce();
 });
 
 // --- shutdown --------------------------------------------------------------
-function shutdown(sig) {
+async function shutdown(sig) {
   log(`received ${sig}, shutting down`);
-  for (const conn of connections) closeConn(conn);
+  for (const out of outputs.values()) {
+    try {
+      await out.stop();
+    } catch {}
+  }
   killCapture();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 1000).unref();
