@@ -466,6 +466,24 @@ el('profile').addEventListener('change', () => {
   syncProfileControl();
   log('latency profile -> floor ' + FILL_FLOOR_MS + ' ms (lower = tighter, more underrun risk)');
 });
+// The playout engine is an AudioWorklet, which some browsers do not have -
+// notably Firefox for Android, where it is disabled. Without this check the
+// only symptom is a cryptic "can't access property addModule" and a Start
+// button that seems to do nothing.
+if (typeof AudioWorkletNode === 'undefined') {
+  el('state').textContent = 'no AudioWorklet in this browser';
+  el('start').disabled = true;
+  log('This browser has no AudioWorklet (Firefox for Android disables it), so');
+  log('the low-latency PCM player cannot run here.');
+  log('Use the HLS page instead - it needs MSE, not AudioWorklet:');
+  log('  ' + new URL('hls.html', window.location.href).toString());
+  const a = document.createElement('a');
+  a.href = new URL('hls.html', window.location.href).toString();
+  a.textContent = 'open the HLS player instead';
+  a.style.color = '#9fd';
+  logEl.appendChild(a);
+}
+
 recomputeGeometry();
 loadProfile();
 </script>
