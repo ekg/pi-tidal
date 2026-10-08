@@ -231,6 +231,21 @@ function diffVsLive(report, ownKey) {
     };
     return;
   }
+  // A live snapshot goes stale silently: it is a point-in-time measurement and
+  // nothing expires it, so an old one would keep powering comparisons against a
+  // mix that has since changed. Refuse rather than mislead.
+  const ageMs = Date.now() - Number(live.takenMs ?? NaN);
+  const STALE_MS = 15 * 60 * 1000;
+  if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > STALE_MS) {
+    report.diffVsLive = {
+      available: false,
+      note: `live snapshot is ${Number.isFinite(ageMs) ? Math.round(ageMs / 60000) + ' min' : 'undated'} old (limit ${STALE_MS / 60000} min); re-run snapshotLive`,
+      bands: Object.fromEntries(bandKeys.map(k => [k, 0])),
+      dominantHzDelta: 0,
+      keyClash: false,
+    };
+    return;
+  }
   const liveMaster = live.master ?? live;
   const liveBands = liveMaster.bands ?? null;
   // Only claim a comparison when the snapshot carries comparable 6-band
@@ -254,7 +269,8 @@ function diffVsLive(report, ownKey) {
   ]));
   report.diffVsLive = {
     available: true,
-    note: 'delta = audition - live, master bands (share of total)'
+    note: 'delta = audition - live, master bands (share of total); live snapshot '
+      + Math.round(ageMs / 1000) + 's old'
       + (liveKey ? '' : '; live key not measured, keyClash unavailable'),
     bands,
     dominantHzDelta: liveDom === null ? 0 : Math.round(report.dominantHz - liveDom),
