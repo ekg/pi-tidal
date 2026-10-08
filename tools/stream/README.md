@@ -102,9 +102,19 @@ process spawned).
   drop-oldest). Listen with `ffplay`:
   `ffplay -i http://<host>:8000/stream.ogg` (VLC: Network → the same URL).
 - **hls** — `hls.mjs` spawns ffmpeg writing an fMP4/AAC playlist + segments
-  into `dir`, served by streamd at `/hls/index.m3u8` (playlist no-store). Open
-  in a browser with an HLS-capable player (Safari natively, or a page using
-  hls.js) at `http://<host>:8787/hls/index.m3u8`.
+  into `dir`, served by streamd at `/hls/index.m3u8` (playlist no-store). It
+  also serves a player page at **`/hls.html`** and the vendored hls.js at
+  `/hls.min.js`, so a browser needs nothing installed and no internet:
+
+      http://<host>:8787/hls.html           # browser (Chrome/Firefox/Safari)
+      ffplay http://<host>:8787/hls/index.m3u8
+      vlc    http://<host>:8787/hls/index.m3u8
+
+  Give the player the PLAYLIST, never a bare `.m4s`: an fMP4 segment is not a
+  standalone file and needs the `init.mp4` init segment (`#EXT-X-MAP`), so
+  probing one fails with "no tfhd was found". Measured in Chrome via hls.js
+  1.7.3: playing, 12 segments loaded, 0 errors, **13 s behind live** — that is
+  HLS's structural floor (7 buffered 2 s segments), not a defect.
 - **ws-opus** — `ws-opus.mjs` spawns ffmpeg reading s16le PCM on stdin and
   writing an Ogg/Opus bitstream to stdout, parses that Ogg bitstream back into
   raw Opus packets, and fans them out over a WebSocket on the daemon's own

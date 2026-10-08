@@ -12,7 +12,13 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { writePcmFrame } from './pcm-writer.mjs';
+
+// This module lives in <stream>/outputs/, so the player page and the vendored
+// hls.js sit one directory up.
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const STREAM_DIR = path.resolve(HERE, '..');
 
 const BASE_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 30000;
@@ -213,6 +219,36 @@ export function createHlsOutput(settings, stream, deps = {}) {
     // playlist is no-store (it is rewritten every segment); segments are
     // no-store too because delete_segments recycles their numbers.
     handleHttp(url, req, res) {
+      // The player page and the vendored decoder live beside the sources, not in
+      // the segment dir. Serve them BEFORE the /hls/ mapping so the live
+      // playlist is never shadowed by them.
+      if (req.method === 'GET' || req.method === 'HEAD') {
+        const STATIC = {
+          '/hls.html': ['hls.html', 'text/html; charset=utf-8'],
+          '/hls': ['hls.html', 'text/html; charset=utf-8'],
+          '/hls/': ['hls.html', 'text/html; charset=utf-8'],
+          '/hls.min.js': [path.join('vendor', 'hls.min.js'), 'application/javascript; charset=utf-8'],
+        };
+        const hit = STATIC[url.pathname];
+        if (hit) {
+          let body;
+          try {
+            body = fs.readFileSync(path.join(STREAM_DIR, hit[0]));
+          } catch {
+            res.writeHead(404, { 'Content-Type': 'text/plain' });
+            res.end(`${hit[0]} not found\n`);
+            return true;
+          }
+          res.writeHead(200, {
+            'Content-Type': hit[1],
+            'Cache-Control': 'no-store',
+            'Content-Length': body.length,
+          });
+          if (req.method === 'HEAD') res.end();
+          else res.end(body);
+          return true;
+        }
+      }
       const prefix = '/hls/';
       if (!url.pathname.startsWith(prefix)) return false;
       if (req.method !== 'GET' && req.method !== 'HEAD') {

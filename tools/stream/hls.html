@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tidal stream — HLS</title>
+<style>
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background:#111; color:#ddd; margin:2rem; max-width:60rem; }
+  h1 { font-size:1.1rem; font-weight:600; color:#9fd; }
+  button { font: inherit; padding:.5rem 1rem; background:#2b6; color:#011; border:0; border-radius:4px; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  audio { width:100%; margin:1rem 0; }
+  table { border-collapse:collapse; }
+  td { padding:.15rem .8rem .15rem 0; }
+  td.k { color:#888; }
+  #log { margin-top:1rem; color:#9a9; white-space:pre-wrap; font-size:12px; max-height:12rem; overflow:auto; }
+  code { background:#1c1c1c; padding:.1rem .3rem; border-radius:3px; }
+</style>
+</head>
+<body>
+<h1>tidal stream — HLS</h1>
+
+<p>Playlist: <code id="pl">…</code> — paste that into VLC/ffplay if you prefer.
+   <button id="play" disabled>play</button> <span id="state">idle</span></p>
+
+<audio id="a" controls preload="none"></audio>
+
+<table>
+  <tr><td class="k">mode</td><td id="mode">-</td></tr>
+  <tr><td class="k">buffered ahead</td><td id="buf">-</td></tr>
+  <tr><td class="k">behind live</td><td id="lat">-</td></tr>
+  <tr><td class="k">segments loaded</td><td id="seg">-</td></tr>
+  <tr><td class="k">errors</td><td id="err">0</td></tr>
+</table>
+
+<div id="log"></div>
+
+<script src="/hls.min.js"></script>
+<script>
+const el = (id) => document.getElementById(id);
+function log(m) { el('log').textContent += m + '\n'; }
+
+// The page is served at /hls.html, so the playlist is its sibling.
+const PLAYLIST = new URL('hls/index.m3u8', window.location.href).toString();
+el('pl').textContent = PLAYLIST;
+
+const audio = el('a');
+let hls = null;
+let errors = 0;
+let segments = 0;
+
+// HLS is segmented: the player necessarily sits some seconds behind live, and
+// "behind live" is the number that matters to a listener — not the network
+// latency. Safari plays HLS natively; Chrome/Firefox need hls.js (vendored
+// locally so this works on a LAN or tailnet with no internet).
+function attach() {
+  // Prefer hls.js WHENEVER MSE is available. canPlayType('application/
+  // vnd.apple.mpegurl') is not a reliable test: Chrome/Chromium return a
+  // non-empty string for it while being unable to play HLS natively, so
+  // testing native first selects a path that silently does nothing.
+  if (window.Hls && window.Hls.isSupported()) {
+    el('mode').textContent = 'hls.js ' + (window.Hls.version || '');
+    hls = new Hls({ lowLatencyMode: true, backBufferLength: 30 });
+    hls.loadSource(PLAYLIST);
+    hls.attachMedia(audio);
+    hls.on(Hls.Events.LEVEL_LOADED, () => { segments++; });
+    hls.on(Hls.Events.ERROR, (_e, data) => {
+      errors++;
+      el('err').textContent = errors;
+      log('error: ' + data.type + '/' + data.details + (data.fatal ? ' (fatal)' : ''));
+      // hls.js recovers from most live errors itself; a fatal network error on
+      // a live playlist usually means the stream is not up yet - retry.
+      if (data.fatal) {
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          log('retrying in 2s (is the hls output on? `stream-ctl output on hls`)');
+          setTimeout(() => hls.startLoad(), 2000);
+        } else {
+          log('unrecoverable; reload the page once the stream is up');
+        }
+      }
+    });
+    log('hls.js attached');
+  } else if (audio.canPlayType('application/vnd.apple.mpegurl')) {
+    el('mode').textContent = 'native (browser HLS)';
+    audio.src = PLAYLIST;
+    log('no MSE; trying native HLS');
+    // Say it out loud if the claim was empty rather than showing a play button
+    // that does nothing.
+    setTimeout(() => {
+      if (audio.readyState === 0 && !audio.error) {
+        log('native HLS claimed support but loaded nothing after 4s — use VLC/ffplay for this URL');
+      }
+    }, 4000);
+  } else {
+    el('state').textContent = 'cannot play HLS here';
+    log('no MSE and no native HLS — use VLC/ffplay for this URL');
+    return;
+  }
+  el('play').disabled = false;
+}
+
+attach();
+
+el('play').addEventListener('click', () => {
+  audio.play().catch((e) => log('play failed: ' + e.message));
+});
+
+setInterval(() => {
+  el('state').textContent = audio.paused ? (audio.currentTime ? 'paused' : 'loading') : 'playing';
+  const b = audio.buffered;
+  el('buf').textContent = b.length ? (b.end(b.length - 1) - audio.currentTime).toFixed(2) + ' s' : '-';
+  // hls.js exposes its own live-edge distance; fall back to the buffer depth.
+  el('lat').textContent = (hls && typeof hls.latency === 'number')
+    ? hls.latency.toFixed(2) + ' s'
+    : (b.length ? (b.end(b.length - 1) - audio.currentTime).toFixed(2) + ' s' : '-');
+  el('seg').textContent = segments;
+}, 500);
+</script>
+</body>
+</html>
